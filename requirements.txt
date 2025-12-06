@@ -1,0 +1,4 @@
+# Requisitos compatibles con Python 3.13
+# (PyInstaller <6.10 no soporta 3.13; usa >=6.10)
+pyinstaller>=6.10,<6.17
+PyQt6>=6.6
