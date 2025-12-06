@@ -2704,6 +2704,7 @@ class MangaTextTool(QMainWindow):
     def choose_color(self, which: str):
         """Selector extendido para `fill`, `outline` y `background_color`.
         Para `fill` permite elegir relleno sólido, degradado lineal simple (2 stops) o una textura (imagen).
+        Con preview en vivo: los cambios se aplican inmediatamente a la caja de texto.
         """
         item = self.current_item()
         if not item: return
@@ -2730,16 +2731,10 @@ class MangaTextTool(QMainWindow):
                     push_cmd(ctx.undo_stack, "Cambiar color fondo", undo, redo)
             return
 
-        # --- Fill chooser (solid / gradient / texture) ---
-        dlg = FillChooserDialog(self, item.style)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        new_spec = dlg.get_result()
-        if not new_spec:
-            return
-
+        # --- Fill chooser (solid / gradient / texture) con preview en vivo ---
         ctx = self.current_ctx()
-        # Snapshot para undo: guardar campos relevantes
+        
+        # Snapshot inicial para poder revertir si se cancela
         old_snapshot = {
             'fill_type': item.style.fill_type,
             'fill': item.style.fill,
@@ -2748,7 +2743,42 @@ class MangaTextTool(QMainWindow):
             'texture_path': item.style.texture_path,
             'texture_tile': item.style.texture_tile,
         }
-
+        
+        def on_preview_update(spec):
+            """Callback para actualizar la caja en tiempo real mientras cambias en el diálogo."""
+            try:
+                item.style.fill_type = spec.get('fill_type', 'solid')
+                item.style.fill = spec.get('fill', item.style.fill)
+                item.style.gradient_stops = spec.get('gradient_stops')
+                item.style.gradient_angle = int(spec.get('gradient_angle', 0))
+                item.style.texture_path = spec.get('texture_path', '')
+                item.style.texture_tile = bool(spec.get('texture_tile', True))
+                item.update()
+                if ctx and ctx.scene:
+                    ctx.scene.update()
+            except Exception:
+                pass
+        
+        dlg = FillChooserDialog(self, item.style, on_update_callback=on_preview_update)
+        
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # Si cancela, revertir al estado anterior
+            item.style.fill_type = old_snapshot['fill_type']
+            item.style.fill = old_snapshot['fill']
+            item.style.gradient_stops = old_snapshot['gradient_stops']
+            item.style.gradient_angle = old_snapshot['gradient_angle']
+            item.style.texture_path = old_snapshot['texture_path']
+            item.style.texture_tile = old_snapshot['texture_tile']
+            item.update()
+            if ctx and ctx.scene:
+                ctx.scene.update()
+            return
+        
+        # Si acepta, registrar el cambio en el undo stack
+        new_spec = dlg.get_result()
+        if not new_spec:
+            return
+        
         def undo():
             item.style.fill_type = old_snapshot['fill_type']
             item.style.fill = old_snapshot['fill']
@@ -3387,24 +3417,35 @@ class FontsPerPresetDialog(QDialog):
 
 
 class FillChooserDialog(QDialog):
-    """Diálogo sencillo con tres pestañas: Sólido, Degradado (2 stops) y Textura."""
-    def __init__(self, parent, style: TextStyle):
+    """Diálogo sencillo con tres pestañas: Sólido, Degradado (2 stops) y Textura.
+    Actualiza la caja de texto en vivo mientras cambias valores (preview en tiempo real).
+    """
+    def __init__(self, parent, style: TextStyle, on_update_callback=None):
         super().__init__(parent)
         self.setWindowTitle("Seleccionar relleno")
-        self.resize(420, 280)
+        self.resize(420, 320)
         self.style = style
+        self.on_update_callback = on_update_callback  # Función para notificar cambios
+        
         lay = QVBoxLayout(self)
         tabs = QTabWidget()
         lay.addWidget(tabs)
 
         # -- Solid
         solid_w = QWidget(); solid_l = QVBoxLayout(solid_w)
+        solid_info = QLabel("💡 Haz clic en 'Elegir color…' para ver los cambios en tiempo real")
+        solid_info.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        solid_l.addWidget(solid_info)
         self.solid_btn = QPushButton("Elegir color…")
         solid_l.addWidget(self.solid_btn); self.solid_preview = QLabel(); solid_l.addWidget(self.solid_preview)
+        solid_l.addStretch()
         tabs.addTab(solid_w, "Sólido")
 
         # -- Gradient
         grad_w = QWidget(); gl = QFormLayout(grad_w)
+        grad_info = QLabel("💡 Haz clic en los botones de color para ver los cambios en tiempo real")
+        grad_info.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        gl.addRow(grad_info)
         self.grad_c1 = QPushButton("Color 1…")
         self.grad_c2 = QPushButton("Color 2…")
         self.grad_angle = QSpinBox(); self.grad_angle.setRange(0, 359); self.grad_angle.setValue(getattr(style, 'gradient_angle', 0))
@@ -3419,17 +3460,20 @@ class FillChooserDialog(QDialog):
         self.tex_tile_chk = QCheckBox("Repetir (tile)"); self.tex_tile_chk.setChecked(getattr(style, 'texture_tile', True))
         tl.addWidget(self.tex_pick); tl.addWidget(self.tex_path_lbl); tl.addWidget(self.tex_tile_chk)
         self.tex_preview = QLabel(); tl.addWidget(self.tex_preview)
+        tl.addStretch()
         tabs.addTab(tex_w, "Textura")
 
         # Buttons
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
 
-        # Conexiones
+        # Conexiones: actualizar en tiempo real
         self.solid_btn.clicked.connect(self._pick_solid)
         self.grad_c1.clicked.connect(lambda: self._pick_grad_color(1))
         self.grad_c2.clicked.connect(lambda: self._pick_grad_color(2))
+        self.grad_angle.valueChanged.connect(lambda: self._notify_update())
         self.tex_pick.clicked.connect(self._pick_texture)
+        self.tex_tile_chk.stateChanged.connect(lambda: self._notify_update())
 
         # estado inicial
         self._solid_color = getattr(style, 'fill', '#000000')
@@ -3443,26 +3487,70 @@ class FillChooserDialog(QDialog):
     def _pick_solid(self):
         dlg = QColorDialog(qcolor_from_hex(self._solid_color), self)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec() == QColorDialog.DialogCode.Accepted:
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+        
+        # Timer para actualizar en vivo mientras el diálogo está abierto
+        timer = QTimer()
+        def on_color_change():
+            cur = dlg.currentColor()
+            if cur.isValid():
+                self._solid_color = cur.name(QColor.NameFormat.HexRgb)
+                self._update_previews()
+                self._notify_update()
+        
+        dlg.currentColorChanged.connect(on_color_change)
+        timer.timeout.connect(on_color_change)
+        timer.start(50)
+        
+        result = dlg.exec()
+        timer.stop()
+        
+        if result == QColorDialog.DialogCode.Accepted:
             self._solid_color = dlg.selectedColor().name(QColor.NameFormat.HexRgb)
             self._update_previews()
+            self._notify_update()
 
     def _pick_grad_color(self, which: int):
         cur = qcolor_from_hex(self._grad_stops[0][1] if which == 1 else self._grad_stops[1][1])
-        dlg = QColorDialog(cur, self); dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        if dlg.exec() == QColorDialog.DialogCode.Accepted:
+        dlg = QColorDialog(cur, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+        
+        # Timer para actualizar en vivo
+        timer = QTimer()
+        def on_color_change():
+            c = dlg.currentColor()
+            if c.isValid():
+                col = c.name(QColor.NameFormat.HexRgb)
+                if which == 1:
+                    self._grad_stops[0] = (0.0, col)
+                else:
+                    self._grad_stops[1] = (1.0, col)
+                self._update_previews()
+                self._notify_update()
+        
+        dlg.currentColorChanged.connect(on_color_change)
+        timer.timeout.connect(on_color_change)
+        timer.start(50)
+        
+        result = dlg.exec()
+        timer.stop()
+        
+        if result == QColorDialog.DialogCode.Accepted:
             col = dlg.selectedColor().name(QColor.NameFormat.HexRgb)
             if which == 1:
                 self._grad_stops[0] = (0.0, col)
             else:
                 self._grad_stops[1] = (1.0, col)
             self._update_previews()
+            self._notify_update()
 
     def _pick_texture(self):
         f, _ = QFileDialog.getOpenFileName(self, "Seleccionar textura", "", "Imágenes (*.png *.jpg *.jpeg *.webp)")
         if not f: return
         self._tex_path = f; self.tex_path_lbl.setText(f)
         self._update_previews()
+        self._notify_update()
 
     def _update_previews(self):
         # Sólido preview
@@ -3487,7 +3575,17 @@ class FillChooserDialog(QDialog):
                     tp = QPainter(tpm); tp.drawPixmap(0,0,s); tp.end()
         self.tex_preview.setPixmap(tpm)
 
-    def get_result(self):
+    def _notify_update(self):
+        """Notifica al callback para actualizar la caja de texto en vivo."""
+        if callable(self.on_update_callback):
+            try:
+                spec = self.get_current_spec()
+                self.on_update_callback(spec)
+            except Exception:
+                pass
+
+    def get_current_spec(self):
+        """Devuelve la especificación actual sin cerrar el diálogo."""
         cur_tab = self.findChild(QTabWidget).currentIndex()
         if cur_tab == 0:
             return {'fill_type': 'solid', 'fill': self._solid_color}
@@ -3495,6 +3593,9 @@ class FillChooserDialog(QDialog):
             return {'fill_type': 'linear_gradient', 'gradient_stops': self._grad_stops, 'gradient_angle': int(self.grad_angle.value())}
         else:
             return {'fill_type': 'texture', 'texture_path': self._tex_path, 'texture_tile': bool(self.tex_tile_chk.isChecked())}
+
+    def get_result(self):
+        return self.get_current_spec()
 
 # ---------------- main ----------------
 def main():
