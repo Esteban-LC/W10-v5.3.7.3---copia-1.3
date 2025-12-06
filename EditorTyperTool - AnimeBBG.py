@@ -28,7 +28,7 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
     QPixmap, QTextCursor, QTextDocument, QTextOption, QShortcut, QKeySequence,
-    QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor
+    QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor, QLinearGradient, QBrush
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsDropShadowEffect, QGraphicsItem,
@@ -475,6 +475,14 @@ class TextStyle:
     bold: bool = False
     italic: bool = False
     fill: str = "#000000"
+    # Tipo de relleno: 'solid' | 'linear_gradient' | 'texture'
+    fill_type: str = 'solid'
+    # Para degradado: lista de (pos, color) stops, pos 0.0-1.0
+    gradient_stops: List[Tuple[float, str]] = None
+    gradient_angle: int = 0
+    # Para textura: ruta a imagen y si se repite (tile) o estira
+    texture_path: str = ""
+    texture_tile: bool = True
     outline: str = "#FFFFFF"
     outline_width: int = 3
     shadow_enabled: bool = False
@@ -634,16 +642,130 @@ class StrokeTextItem(QGraphicsTextItem):
             c.setAlpha(int(clamp(self.style.background_opacity, 0, 1) * 255))
             painter.fillRect(br, c)
 
-        ow = self.style.outline_width
+        ow = int(max(0, round(float(self.style.outline_width))))
         if ow > 0:
             outline_col = qcolor_from_hex(self.style.outline)
-            for dx in (-ow, 0, ow):
-                for dy in (-ow, 0, ow):
-                    if dx == 0 and dy == 0: continue
-                    painter.save(); painter.translate(dx, dy)
-                    self.setDefaultTextColor(outline_col); super().paint(painter, option, widget); painter.restore()
+            # Rasterizar el texto una vez con el color de contorno y luego dibujar esa imagen
+            # desplazada en los offsets necesarios. Esto evita llamar a super().paint muchas veces
+            # (costoso) y suele ser mucho más rápido.
+            br = super().boundingRect()
+            pad = ow
+            img_w = max(1, int(math.ceil(br.width())) + pad * 2)
+            img_h = max(1, int(math.ceil(br.height())) + pad * 2)
+            img = QImage(img_w, img_h, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(Qt.GlobalColor.transparent)
 
-        self.setDefaultTextColor(qcolor_from_hex(self.style.fill)); super().paint(painter, option, widget)
+            img_p = QPainter(img)
+            img_p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            # Preparar contexto para que super().paint dibuje en la posición correcta dentro de la imagen
+            img_p.translate(pad - br.left(), pad - br.top())
+            # Poner color de contorno temporalmente
+            prev_color = self.defaultTextColor()
+            self.setDefaultTextColor(outline_col)
+            super().paint(img_p, option, widget)
+            self.setDefaultTextColor(prev_color)
+            img_p.end()
+
+            # Dibujar la imagen de contorno muestreada en offsets (densidad limitada)
+            max_samples = 11
+            if ow <= max_samples:
+                step = 1
+            else:
+                step = max(1, ow // max_samples)
+
+            base_x = br.left() - pad
+            base_y = br.top() - pad
+            for dx in range(-ow, ow + 1, step):
+                for dy in range(-ow, ow + 1, step):
+                    if dx == 0 and dy == 0:
+                        continue
+                    painter.drawImage(QPointF(base_x + dx, base_y + dy), img)
+
+        # Relleno (puede ser sólido, degradado o textura)
+        try:
+            if getattr(self.style, 'fill_type', 'solid') == 'solid':
+                self.setDefaultTextColor(qcolor_from_hex(self.style.fill)); super().paint(painter, option, widget)
+            else:
+                # Obtener rect y dimensiones
+                br = super().boundingRect()
+                pad = 2
+                w = max(1, int(math.ceil(br.width())))
+                h = max(1, int(math.ceil(br.height())))
+
+                mask_img = QImage(w + pad*2, h + pad*2, QImage.Format.Format_ARGB32_Premultiplied)
+                mask_img.fill(Qt.GlobalColor.transparent)
+                mp = QPainter(mask_img)
+                mp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                mp.translate(pad - br.left(), pad - br.top())
+                # Dibujar texto en blanco para crear máscara alfa
+                prev_col = self.defaultTextColor()
+                self.setDefaultTextColor(QColor('white'))
+                super().paint(mp, option, widget)
+                self.setDefaultTextColor(prev_col)
+                mp.end()
+
+                # Crear imagen de relleno
+                fill_img = QImage(mask_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                fill_img.fill(Qt.GlobalColor.transparent)
+                fp = QPainter(fill_img)
+                fp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+                if self.style.fill_type == 'linear_gradient' and self.style.gradient_stops:
+                    # Crear gradiente lineal simple
+                    angle = float(getattr(self.style, 'gradient_angle', 0))
+                    # Coordenadas para gradiente: de izquierda a derecha por defecto
+                    x1 = 0; y1 = 0; x2 = fill_img.width(); y2 = 0
+                    # Rotar vector por angle
+                    import math as _math
+                    rad = _math.radians(angle)
+                    cx = fill_img.width()/2; cy = fill_img.height()/2
+                    dx = _math.cos(rad) * fill_img.width()/2
+                    dy = _math.sin(rad) * fill_img.height()/2
+                    x1 = cx - dx; y1 = cy - dy; x2 = cx + dx; y2 = cy + dy
+                    grad = QLinearGradient(QPointF(x1, y1), QPointF(x2, y2))
+                    stops = getattr(self.style, 'gradient_stops', []) or []
+                    # stops expected as list of (pos, hex)
+                    for pos, col in stops:
+                        try: grad.setColorAt(float(pos), qcolor_from_hex(col))
+                        except Exception: pass
+                    fp.fillRect(fill_img.rect(), grad)
+
+                elif self.style.fill_type == 'texture' and getattr(self.style, 'texture_path', ''):
+                    tp = getattr(self.style, 'texture_path', '')
+                    pm = QPixmap(tp) if tp else QPixmap()
+                    if not pm.isNull():
+                        if getattr(self.style, 'texture_tile', True):
+                            brush = QBrush(pm)
+                            fp.fillRect(fill_img.rect(), brush)
+                        else:
+                            # escalar para cubrir
+                            s = pm.scaled(fill_img.width(), fill_img.height(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                            fp.drawPixmap(0, 0, s)
+                    else:
+                        fp.fillRect(fill_img.rect(), qcolor_from_hex(self.style.fill))
+                else:
+                    fp.fillRect(fill_img.rect(), qcolor_from_hex(self.style.fill))
+
+                fp.end()
+
+                # Aplicar máscara alfa: conservar sólo las áreas donde mask_img tiene alfa
+                result = QImage(fill_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                result.fill(Qt.GlobalColor.transparent)
+                rp = QPainter(result)
+                rp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                rp.drawImage(0, 0, fill_img)
+                rp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+                rp.drawImage(0, 0, mask_img)
+                rp.end()
+
+                # Dibujar resultado en el painter principal
+                painter.drawImage(QPointF(br.left()-pad, br.top()-pad), result)
+        except Exception:
+            # Fallback a comportamiento simple si algo falla
+            try:
+                self.setDefaultTextColor(qcolor_from_hex(self.style.fill)); super().paint(painter, option, widget)
+            except Exception:
+                pass
 
         try:
             if getattr(self, 'ordinal', -1) >= 0 and not getattr(self, '_suppress_overlays', False):
@@ -2579,112 +2701,73 @@ class MangaTextTool(QMainWindow):
         return {'fill': qcolor_from_hex(item.style.fill, "#000000"),
                 'outline': qcolor_from_hex(item.style.outline, "#FFFFFF"),
                 'background_color': qcolor_from_hex(item.style.background_color, "#FFFFFF")}.get(which, QColor("#000000"))
-
     def choose_color(self, which: str):
+        """Selector extendido para `fill`, `outline` y `background_color`.
+        Para `fill` permite elegir relleno sólido, degradado lineal simple (2 stops) o una textura (imagen).
+        """
         item = self.current_item()
         if not item: return
-        
-        initial = self._get_current_qcolor(which, item)
-        
-        # Guardar el color original para poder revertir si se cancela
-        if which == 'fill':
-            original_color = item.style.fill
-        elif which == 'outline':
-            original_color = item.style.outline
-        elif which == 'background_color':
-            original_color = item.style.background_color
-        else:
+
+        if which != 'fill':
+            # Mantener comportamiento previo para outline y background
+            initial = self._get_current_qcolor(which, item)
+            color_dialog = QColorDialog(initial, self)
+            color_dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+            color_dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+            result = color_dialog.exec()
+            if result == QColorDialog.DialogCode.Accepted:
+                final_color = color_dialog.selectedColor().name(QColor.NameFormat.HexRgb)
+                ctx = self.current_ctx()
+                if which == 'outline':
+                    old = item.style.outline
+                    def undo(): item.style.outline = old; item.update()
+                    def redo(): item.style.outline = final_color; item.update()
+                    push_cmd(ctx.undo_stack, "Cambiar color", undo, redo)
+                else:
+                    old = item.style.background_color
+                    def undo(): item.style.background_color = old; item.update()
+                    def redo(): item.style.background_color = final_color; item.update()
+                    push_cmd(ctx.undo_stack, "Cambiar color fondo", undo, redo)
             return
-        
-        # Crear el diálogo de color con opciones específicas
-        color_dialog = QColorDialog(initial, self)
-        # No usar diálogo nativo en Windows para mejor compatibilidad con la señal currentColorChanged
-        color_dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        color_dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
-        
-        # Variable para rastrear el último color aplicado
-        last_applied_color = initial.name(QColor.NameFormat.HexRgb)
-        
-        # Función para aplicar color en tiempo real (preview)
-        def apply_color_preview():
-            nonlocal last_applied_color
-            current = color_dialog.currentColor()
-            if not current.isValid():
-                return
-            
-            current_hex = current.name(QColor.NameFormat.HexRgb)
-            # Solo actualizar si el color cambió
-            if current_hex == last_applied_color:
-                return
-                
-            last_applied_color = current_hex
-            
-            if which == 'fill':
-                item.style.fill = current_hex
-            elif which == 'outline':
-                item.style.outline = current_hex
-            elif which == 'background_color':
-                item.style.background_color = current_hex
-            
-            # Forzar repintado inmediato
-            item.update()
-            if item.scene():
-                item.scene().update()
-        
-        # Timer para monitorear cambios de color continuamente (cada 50ms)
-        timer = QTimer()
-        timer.timeout.connect(apply_color_preview)
-        timer.start(50)  # Actualizar cada 50 milisegundos
-        
-        # También conectar la señal para cambios explícitos
-        color_dialog.currentColorChanged.connect(lambda: apply_color_preview())
-        
-        # Ejecutar el diálogo
-        result = color_dialog.exec()
-        
-        # Detener el timer cuando se cierra el diálogo
-        timer.stop()
-        
-        # Si el usuario aceptó, registrar el cambio en el historial de deshacer
-        if result == QColorDialog.DialogCode.Accepted:
-            final_color = color_dialog.selectedColor()
-            ctx = self.current_ctx()
-            
-            # Snapshot para undo
-            old_color = original_color
-            new_color = final_color.name(QColor.NameFormat.HexRgb)
-            
-            def undo():
-                if which == 'fill':
-                    item.style.fill = old_color
-                    item.setDefaultTextColor(qcolor_from_hex(old_color))
-                elif which == 'outline':
-                    item.style.outline = old_color
-                elif which == 'background_color':
-                    item.style.background_color = old_color
-                item.update()
-            
-            def redo():
-                if which == 'fill':
-                    item.style.fill = new_color
-                    item.setDefaultTextColor(final_color)
-                elif which == 'outline':
-                    item.style.outline = new_color
-                elif which == 'background_color':
-                    item.style.background_color = new_color
-                item.update()
-            
-            push_cmd(ctx.undo_stack, "Cambiar color", undo, redo)
-        else:
-            # Si se canceló, restaurar el color original
-            if which == 'fill':
-                item.style.fill = original_color
-                item.setDefaultTextColor(qcolor_from_hex(original_color))
-            elif which == 'outline':
-                item.style.outline = original_color
-            elif which == 'background_color':
-                item.style.background_color = original_color
-            item.update()
+
+        # --- Fill chooser (solid / gradient / texture) ---
+        dlg = FillChooserDialog(self, item.style)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_spec = dlg.get_result()
+        if not new_spec:
+            return
+
+        ctx = self.current_ctx()
+        # Snapshot para undo: guardar campos relevantes
+        old_snapshot = {
+            'fill_type': item.style.fill_type,
+            'fill': item.style.fill,
+            'gradient_stops': list(item.style.gradient_stops) if item.style.gradient_stops else None,
+            'gradient_angle': item.style.gradient_angle,
+            'texture_path': item.style.texture_path,
+            'texture_tile': item.style.texture_tile,
+        }
+
+        def undo():
+            item.style.fill_type = old_snapshot['fill_type']
+            item.style.fill = old_snapshot['fill']
+            item.style.gradient_stops = old_snapshot['gradient_stops']
+            item.style.gradient_angle = old_snapshot['gradient_angle']
+            item.style.texture_path = old_snapshot['texture_path']
+            item.style.texture_tile = old_snapshot['texture_tile']
+            item.update(); ctx and ctx.scene.update()
+
+        def redo():
+            item.style.fill_type = new_spec.get('fill_type', 'solid')
+            item.style.fill = new_spec.get('fill', item.style.fill)
+            item.style.gradient_stops = new_spec.get('gradient_stops')
+            item.style.gradient_angle = int(new_spec.get('gradient_angle', 0))
+            item.style.texture_path = new_spec.get('texture_path', '')
+            item.style.texture_tile = bool(new_spec.get('texture_tile', True))
+            item.update(); ctx and ctx.scene.update()
+
+        push_cmd(ctx.undo_stack, "Cambiar relleno texto", undo, redo)
 
     def on_no_stroke_toggle(self, state: int):
         item = self.current_item(); ctx = self.current_ctx()
@@ -3301,6 +3384,117 @@ class FontsPerPresetDialog(QDialog):
     def apply_changes(self):
         for k, sp in self.size_spins.items(): self.presets[k].font_point_size = int(sp.value())
         return self.apply_chk.isChecked()
+
+
+class FillChooserDialog(QDialog):
+    """Diálogo sencillo con tres pestañas: Sólido, Degradado (2 stops) y Textura."""
+    def __init__(self, parent, style: TextStyle):
+        super().__init__(parent)
+        self.setWindowTitle("Seleccionar relleno")
+        self.resize(420, 280)
+        self.style = style
+        lay = QVBoxLayout(self)
+        tabs = QTabWidget()
+        lay.addWidget(tabs)
+
+        # -- Solid
+        solid_w = QWidget(); solid_l = QVBoxLayout(solid_w)
+        self.solid_btn = QPushButton("Elegir color…")
+        solid_l.addWidget(self.solid_btn); self.solid_preview = QLabel(); solid_l.addWidget(self.solid_preview)
+        tabs.addTab(solid_w, "Sólido")
+
+        # -- Gradient
+        grad_w = QWidget(); gl = QFormLayout(grad_w)
+        self.grad_c1 = QPushButton("Color 1…")
+        self.grad_c2 = QPushButton("Color 2…")
+        self.grad_angle = QSpinBox(); self.grad_angle.setRange(0, 359); self.grad_angle.setValue(getattr(style, 'gradient_angle', 0))
+        gl.addRow("Color inicio", self.grad_c1); gl.addRow("Color fin", self.grad_c2); gl.addRow("Ángulo", self.grad_angle)
+        self.grad_preview = QLabel(); gl.addRow(self.grad_preview)
+        tabs.addTab(grad_w, "Degradado")
+
+        # -- Texture
+        tex_w = QWidget(); tl = QVBoxLayout(tex_w)
+        self.tex_pick = QPushButton("Elegir imagen…")
+        self.tex_path_lbl = QLabel(getattr(style, 'texture_path', '') or "(ninguna)")
+        self.tex_tile_chk = QCheckBox("Repetir (tile)"); self.tex_tile_chk.setChecked(getattr(style, 'texture_tile', True))
+        tl.addWidget(self.tex_pick); tl.addWidget(self.tex_path_lbl); tl.addWidget(self.tex_tile_chk)
+        self.tex_preview = QLabel(); tl.addWidget(self.tex_preview)
+        tabs.addTab(tex_w, "Textura")
+
+        # Buttons
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
+
+        # Conexiones
+        self.solid_btn.clicked.connect(self._pick_solid)
+        self.grad_c1.clicked.connect(lambda: self._pick_grad_color(1))
+        self.grad_c2.clicked.connect(lambda: self._pick_grad_color(2))
+        self.tex_pick.clicked.connect(self._pick_texture)
+
+        # estado inicial
+        self._solid_color = getattr(style, 'fill', '#000000')
+        gs = getattr(style, 'gradient_stops', None) or [(0.0, getattr(style, 'fill', '#000000')), (1.0, getattr(style, 'fill', '#ffffff'))]
+        self._grad_stops = gs
+        self._grad_angle = int(getattr(style, 'gradient_angle', 0))
+        self._tex_path = getattr(style, 'texture_path', '')
+        self._tex_tile = bool(getattr(style, 'texture_tile', True))
+        self._update_previews()
+
+    def _pick_solid(self):
+        dlg = QColorDialog(qcolor_from_hex(self._solid_color), self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec() == QColorDialog.DialogCode.Accepted:
+            self._solid_color = dlg.selectedColor().name(QColor.NameFormat.HexRgb)
+            self._update_previews()
+
+    def _pick_grad_color(self, which: int):
+        cur = qcolor_from_hex(self._grad_stops[0][1] if which == 1 else self._grad_stops[1][1])
+        dlg = QColorDialog(cur, self); dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec() == QColorDialog.DialogCode.Accepted:
+            col = dlg.selectedColor().name(QColor.NameFormat.HexRgb)
+            if which == 1:
+                self._grad_stops[0] = (0.0, col)
+            else:
+                self._grad_stops[1] = (1.0, col)
+            self._update_previews()
+
+    def _pick_texture(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Seleccionar textura", "", "Imágenes (*.png *.jpg *.jpeg *.webp)")
+        if not f: return
+        self._tex_path = f; self.tex_path_lbl.setText(f)
+        self._update_previews()
+
+    def _update_previews(self):
+        # Sólido preview
+        pm = QPixmap(120, 32); pm.fill(qcolor_from_hex(self._solid_color)); self.solid_preview.setPixmap(pm)
+        # Grad preview
+        gpm = QPixmap(120, 32); gp = QPainter(gpm); grad = QLinearGradient(0,0,120,0)
+        try:
+            grad.setColorAt(0.0, qcolor_from_hex(self._grad_stops[0][1])); grad.setColorAt(1.0, qcolor_from_hex(self._grad_stops[1][1]))
+        except Exception:
+            pass
+        gp.fillRect(gpm.rect(), grad); gp.end(); self.grad_preview.setPixmap(gpm)
+        # Texture preview
+        tpm = QPixmap(120, 32); tpm.fill(Qt.GlobalColor.transparent)
+        if self._tex_path:
+            pix = QPixmap(self._tex_path)
+            if not pix.isNull():
+                if self._tex_tile:
+                    brush = QBrush(pix)
+                    tp = QPainter(tpm); tp.fillRect(tpm.rect(), brush); tp.end()
+                else:
+                    s = pix.scaled(120, 32, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                    tp = QPainter(tpm); tp.drawPixmap(0,0,s); tp.end()
+        self.tex_preview.setPixmap(tpm)
+
+    def get_result(self):
+        cur_tab = self.findChild(QTabWidget).currentIndex()
+        if cur_tab == 0:
+            return {'fill_type': 'solid', 'fill': self._solid_color}
+        elif cur_tab == 1:
+            return {'fill_type': 'linear_gradient', 'gradient_stops': self._grad_stops, 'gradient_angle': int(self.grad_angle.value())}
+        else:
+            return {'fill_type': 'texture', 'texture_path': self._tex_path, 'texture_tile': bool(self.tex_tile_chk.isChecked())}
 
 # ---------------- main ----------------
 def main():
