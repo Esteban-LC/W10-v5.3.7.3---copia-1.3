@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Callable
 import socket
 import platform
-from datetime import datetime
+from datetime import datetime, timezone
 import webbrowser  # asegúrate de tener esto importado arriba
 from pathlib import Path
 
@@ -28,7 +28,8 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
     QPixmap, QTextCursor, QTextDocument, QTextOption, QShortcut, QKeySequence,
-    QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor, QLinearGradient, QBrush
+    QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor, QLinearGradient, QBrush,
+    QFontDatabase
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsDropShadowEffect, QGraphicsItem,
@@ -47,6 +48,14 @@ try:
 except ImportError:
     WORKFLOW_AVAILABLE = False
     print("[WARNING] automated_workflow module not found. Workflow features disabled.")
+
+# Import PSD support
+try:
+    from psd_tools import PSDImage
+    PSD_AVAILABLE = True
+except ImportError:
+    PSD_AVAILABLE = False
+    print("[WARNING] psd-tools not available. PSD import disabled.")
 
 # Carpeta base del script
 BASE_DIR = Path(__file__).resolve().parent
@@ -126,7 +135,7 @@ def check_user_exists_and_log(username: str) -> bool:
         ip_local = "desconocida"
 
     # Marca de tiempo (UTC)
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     # Se registra: fecha/hora, usuario, ip, hostname, sistema
     ws_logs.append_row([now, username, ip_local, hostname, system_str])
@@ -224,6 +233,20 @@ def qcolor_from_hex(s: str, default: str = "#000000") -> QColor:
     except Exception: return QColor(default)
 
 def clamp(v, a, b): return max(a, min(v, b))
+
+# ---- Font Utilities ----
+def is_font_installed(family_name: str) -> bool:
+    """Verifica si una fuente está instalada en el sistema."""
+    db = QFontDatabase()
+    families = db.families()
+    return family_name in families
+
+def get_safe_font_family(requested_family: str, fallback: str = "Arial") -> str:
+    """Devuelve el nombre de la fuente solicitada si está disponible, sino el fallback."""
+    if is_font_installed(requested_family):
+        return requested_family
+    return fallback
+
 def rects_intersect(a: QRectF, b: QRectF) -> bool: return a.intersects(b)
 
 # ---- UI Scaling ----
@@ -497,6 +520,7 @@ class TextStyle:
     background_opacity: float = 0.0
     capitalization: str = "mixed"
     def to_qfont(self) -> QFont:
+        """Crea QFont desde este estilo."""
         f = QFont(self.font_family, self.font_point_size); f.setBold(self.bold); f.setItalic(self.italic)
         cap_map = {
             'mixed': QFont.Capitalization.MixedCase,
@@ -570,6 +594,54 @@ def parse_identifier(line: str):
     if s.startswith('""'):  return 'TITULO', s[2:].lstrip()
     return 'GLOBO', s
 
+# ---------------- Capa de imagen movible ----------------
+class MovableImageLayer(QGraphicsPixmapItem):
+    """Capa de imagen que puede ser seleccionada y movida en el lienzo."""
+    def __init__(self, pixmap: QPixmap, layer_name: str = "Capa"):
+        super().__init__(pixmap)
+        self.name = layer_name
+        self.layer_name = layer_name
+        self.ordinal = -1
+        self.locked = False
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self._dragging = False
+    
+    def paint(self, painter, option, widget=None):
+        """Dibuja la capa con un borde de selección si está seleccionada."""
+        super().paint(painter, option, widget)
+        
+        if self.isSelected():
+            # Dibujar borde de selección
+            painter.setPen(QPen(QColor("#E11D48"), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(self.boundingRect())
+    
+    def mousePressEvent(self, event):
+        """Permite arrastrar la capa."""
+        self._dragging = True
+        super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """Actualiza posición durante el arrastre."""
+        if self._dragging:
+            super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """Finaliza el arrastre."""
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+    
+    def hoverEnterEvent(self, event):
+        """Cambia cursor al pasar el mouse."""
+        self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        super().hoverEnterEvent(event)
+    
+    def hoverLeaveEvent(self, event):
+        """Restaura cursor normal."""
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        super().hoverLeaveEvent(event)
+
 # ---------------- Ítem de texto ----------------
 class StrokeTextItem(QGraphicsTextItem):
     HANDLE_SIZE = 10; ROT_HANDLE_R = 7
@@ -584,11 +656,15 @@ class StrokeTextItem(QGraphicsTextItem):
         self.style = style; self.name = name; self.locked: bool = False
         self.ordinal: int = -1
         self._suppress_overlays: bool = False
+        # Rastrear si la fuente original está disponible (para advertencia tipo Photoshop)
+        self.original_font_family: str = style.font_family
+        self.font_missing_warning_shown: bool = False
 
         self._start_pos = QPointF(0, 0); self._old_text = text
         self._resizing = False; self._resize_start_width = 0.0; self._resize_start_pos = QPointF(0, 0)
         self._resize_alt_scale = False; self._start_font_pt = float(style.font_point_size); self._start_outline = float(style.outline_width)
         self._rotating = False; self._rot_start_angle = 0.0; self._rot_base = 0.0
+        # Aplicar fuente (Sin cambiar a fallback automático — solo detectar para advertencia)
         self.setFont(style.to_qfont()); self._apply_paragraph_to_doc()
         self.setTextWidth(400); self.apply_shadow(); self.background_enabled = style.background_enabled
 
@@ -979,8 +1055,9 @@ class StrokeTextItem(QGraphicsTextItem):
         item = StrokeTextItem(d.get('text', ''), st, name=d.get('name', 'Texto'))
         item.ordinal = int(d.get('ordinal', -1))
         item.setTextWidth(d.get('width', 400))
-        item.setPos(QPointF(*d.get('pos', [0, 0])))
-        item.setRotation(float(d.get('rotation', 0.0)))
+        # Guardar datos para aplicar DESPUÉS de agregarse a la escena
+        item._restore_pos = QPointF(*d.get('pos', [0, 0]))
+        item._restore_rotation = float(d.get('rotation', 0.0))
         item.set_locked(bool(d.get('locked', False)))
         item.apply_shadow()
         return item
@@ -1130,6 +1207,15 @@ class PageContext(QWidget):
         self.layer_list = QListWidget()
 
         self.layer_list.currentItemChanged.connect(self.on_layer_selected)
+        # Enable drag & drop reordering so users can change layer stacking order
+        from PyQt6.QtWidgets import QAbstractItemView
+        self.layer_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        # Connect to rowsMoved to update scene Z-values after reorder
+        try:
+            self.layer_list.model().rowsMoved.connect(self._on_layers_reordered)
+        except Exception:
+            # Some PyQt versions may not emit this or model may be different
+            pass
 
 
         # --- Panel colapsable al estilo Photoshop ---
@@ -1406,7 +1492,65 @@ class PageContext(QWidget):
         return items or ([self.current_item()] if self.current_item() else [])
 
     def add_item_and_list(self, item: StrokeTextItem):
-        if item.scene() is None: self.scene.addItem(item)
+        if item.scene() is None: 
+            self.scene.addItem(item)
+        
+        # Aplicar posición y rotación guardadas INMEDIATAMENTE después de agregar a la escena
+        # Usar QTimer para garantizar que Qt haya procesado el addItem() antes de setPos()
+        def apply_transforms():
+            try:
+                # Helper to apply a stored position; make it relative to background if that seems intended
+                def _apply_pos(stored_pos_attr):
+                    stored = getattr(item, stored_pos_attr, None)
+                    if stored is None:
+                        return
+                    try:
+                        # Default: use stored directly
+                        final = QPointF(stored)
+                        # If item is in a scene with a PageContext that has a bg_item,
+                        # and the stored coords lie within the background bounds, treat
+                        # the stored coords as relative to the background top-left.
+                        sc = item.scene()
+                        if sc is not None and hasattr(sc, 'parent'):
+                            ctx = sc.parent()
+                            try:
+                                bg = getattr(ctx, 'bg_item', None)
+                                if bg is not None and isinstance(bg, QGraphicsPixmapItem):
+                                    pm = bg.pixmap()
+                                    if not pm.isNull():
+                                        w = pm.width(); h = pm.height()
+                                        if 0 <= stored.x() <= w and 0 <= stored.y() <= h:
+                                            final = bg.pos() + stored
+                            except Exception:
+                                pass
+                        item.setPos(final)
+                    except Exception:
+                        pass
+                    try:
+                        delattr(item, stored_pos_attr)
+                    except Exception:
+                        pass
+
+                if hasattr(item, '_restore_pos'):
+                    _apply_pos('_restore_pos')
+                if hasattr(item, '_restore_rotation'):
+                    try: item.setRotation(item._restore_rotation)
+                    except Exception: pass
+                    try: delattr(item, '_restore_rotation')
+                    except Exception: pass
+                if hasattr(item, '_pending_pos'):
+                    _apply_pos('_pending_pos')
+                if hasattr(item, '_pending_rotation'):
+                    try: item.setRotation(item._pending_rotation)
+                    except Exception: pass
+                    try: delattr(item, '_pending_rotation')
+                    except Exception: pass
+            except Exception:
+                pass
+        
+        # Ejecutar en el próximo ciclo de eventos
+        QTimer.singleShot(0, apply_transforms)
+        
         try:
             if getattr(item, 'ordinal', -1) < 0:
                 item.ordinal = self._next_ordinal
@@ -1417,6 +1561,48 @@ class PageContext(QWidget):
         li = QListWidgetItem(text_label); li.setData(Qt.ItemDataRole.UserRole, item)
         li.setToolTip("Fijado" if item.locked else "")
         self.layer_list.addItem(li); self.layer_list.setCurrentItem(li)
+        # Recalcular Z-values para que el índice de la lista refleje el apilamiento
+        try:
+            self._recalc_z_from_list()
+        except Exception:
+            pass
+
+    def _recalc_z_from_list(self):
+        """Recalcula los z-values de todos los items según el orden actual de la lista.
+
+        El índice 0 de la lista se considera el topmost (mayor Z).
+        """
+        try:
+            count = self.layer_list.count()
+            for i in range(count):
+                it = self.layer_list.item(i)
+                obj = it.data(Qt.ItemDataRole.UserRole)
+                try:
+                    if isinstance(obj, QGraphicsItem):
+                        obj.setZValue(count - i)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_layers_reordered(self, parent, start, end, destination, row):
+        """Recalculate Z-values for items according to the new list order.
+
+        The item at list index 0 will be treated as topmost (higher Z).
+        """
+        try:
+            count = self.layer_list.count()
+            for i in range(count):
+                it = self.layer_list.item(i)
+                obj = it.data(Qt.ItemDataRole.UserRole)
+                # Many layer objects are QGraphicsItem-derived; set Z accordingly
+                try:
+                    if isinstance(obj, QGraphicsItem):
+                        obj.setZValue(count - i)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def remove_item_from_list(self, item: StrokeTextItem):
         for i in range(self.layer_list.count()):
@@ -2394,11 +2580,18 @@ class MangaTextTool(QMainWindow):
 
     # ---------------- Acciones principales ----------------
     def open_images(self):
+        filter_str = "Todos los archivos soportados (*.png *.jpg *.jpeg *.webp *.bbg"
+        if PSD_AVAILABLE:
+            filter_str += " *.psd"
+        filter_str += ");;Imágenes (*.png *.jpg *.jpeg *.webp);;Proyectos (*.bbg)"
+        if PSD_AVAILABLE:
+            filter_str += ";;Photoshop (*.psd)"
+        
         files, _ = QFileDialog.getOpenFileNames(
             self, 
-            "Abrir imagen(es) o proyecto(s)", 
+            "Abrir imagen(es), proyecto(s) o PSD", 
             "", 
-            "Todos los archivos soportados (*.png *.jpg *.jpeg *.webp *.bbg);;Imágenes (*.png *.jpg *.jpeg *.webp);;Proyectos (*.bbg)"
+            filter_str
         )
         if not files: 
             return
@@ -2406,9 +2599,13 @@ class MangaTextTool(QMainWindow):
         # Procesar cada archivo según su extensión
         for f in files:
             file_path = Path(f)
-            if file_path.suffix.lower() == '.bbg':
+            suffix = file_path.suffix.lower()
+            if suffix == '.bbg':
                 # Es un archivo .bbg, usar la función de abrir proyecto
                 self._open_single_project_bbg(str(file_path))
+            elif suffix == '.psd' and PSD_AVAILABLE:
+                # Es un archivo PSD
+                self.open_psd_file(str(file_path))
             else:
                 # Es una imagen
                 self.add_tab_for_image(file_path)
@@ -2553,6 +2750,19 @@ class MangaTextTool(QMainWindow):
               self.rotate_slider, self.symb_combo, self.no_stroke_chk,
               self.shadow_chk, self.bg_chk, self.bg_op, self.cap_combo, self.bold_chk]
         for w in bs: w.blockSignals(True)
+
+        # NUEVO: Mostrar advertencia si la fuente original no está disponible (tipo Photoshop)
+        if (hasattr(item, 'original_font_family') and 
+            item.original_font_family != item.style.font_family and 
+            not item.font_missing_warning_shown):
+            QMessageBox.warning(
+                self, "Fuente faltante", 
+                f"La fuente '{item.original_font_family}' no está instalada en tu sistema.\n\n"
+                f"Se está usando '{item.style.font_family}' como fallback.\n\n"
+                f"Si editas este texto, se guardará con la fuente fallback. "
+                f"Para restaurar la fuente original, instálala en tu sistema e reabre el proyecto."
+            )
+            item.font_missing_warning_shown = True
 
         self.width_spin.setValue(int(item.textWidth()))
         
@@ -3262,6 +3472,110 @@ class MangaTextTool(QMainWindow):
 
         # aplica marca de agua si procede
         self._apply_wm_to_ctx(ctx)
+        return True
+
+    def open_psd_file(self, fname: str) -> bool:
+        """Abre un archivo PSD y extrae imagen(es) y textos."""
+        if not PSD_AVAILABLE:
+            QMessageBox.warning(self, "PSD", "psd-tools no está instalado. No se puede abrir PSD."); return False
+        
+        try:
+            psd = PSDImage.open(fname)
+        except Exception as e:
+            QMessageBox.warning(self, "PSD", f"No se pudo abrir el archivo PSD:\n{fname}\n\n{e}"); return False
+        
+        # Obtener capas de imagen (PixelLayer con píxeles)
+        image_layers = [layer for layer in psd if not layer.is_group() and hasattr(layer, 'has_pixels') and layer.has_pixels()]
+        
+        if not image_layers:
+            QMessageBox.warning(self, "PSD", "No se encontraron capas de imagen en el PSD."); return False
+        
+        # Usar la primera capa de imagen como fondo principal
+        bg_layer = image_layers[0]
+        
+        # Convertir capa de imagen a QPixmap
+        try:
+            img_pil = bg_layer.composite()
+            if img_pil is None:
+                QMessageBox.warning(self, "PSD", "No se pudo extraer la imagen de la capa."); return False
+            
+            # Convertir PIL Image a QPixmap
+            img_data = QByteArray()
+            buf = QBuffer(img_data)
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
+            img_pil.save(buf, "PNG")
+            buf.close()
+            
+            bg_image = QImage.fromData(img_data, "PNG")
+            if bg_image.isNull():
+                QMessageBox.warning(self, "PSD", "No se pudo convertir la imagen."); return False
+            
+            pix = QPixmap.fromImage(bg_image)
+        except Exception as e:
+            QMessageBox.warning(self, "PSD", f"Error extrayendo imagen:\n{e}"); return False
+        
+        # Crear contexto
+        ctx = PageContext(pix, Path(fname))
+        
+        # Construir listas de items (no los añadimos aún): primero textos, luego overlays
+        overlay_items = []
+        for i, img_layer in enumerate(image_layers[1:], start=1):
+            try:
+                overlay_pil = img_layer.composite()
+                if overlay_pil is None:
+                    continue
+                overlay_data = QByteArray()
+                overlay_buf = QBuffer(overlay_data)
+                overlay_buf.open(QIODevice.OpenModeFlag.WriteOnly)
+                overlay_pil.save(overlay_buf, "PNG")
+                overlay_buf.close()
+                overlay_img = QImage.fromData(overlay_data, "PNG")
+                if overlay_img.isNull():
+                    continue
+                overlay_pix = QPixmap.fromImage(overlay_img)
+                overlay_item = MovableImageLayer(overlay_pix, f"Capa {i}: {getattr(img_layer, 'name', 'IMPORTADO')}")
+                overlay_item._pending_pos = QPointF(getattr(img_layer, 'left', 0), getattr(img_layer, 'top', 0))
+                overlay_items.append(overlay_item)
+            except Exception as e:
+                print(f"Error preparando capa de imagen {i}: {e}")
+                continue
+        
+        # Extraer capas de texto
+        text_layers = [layer for layer in psd.descendants() if layer.kind == "type"]
+        
+        text_items = []
+        for text_layer in text_layers:
+            try:
+                text_str = getattr(text_layer, 'text', '')
+                if not text_str:
+                    continue
+                left = getattr(text_layer, 'left', 0)
+                top = getattr(text_layer, 'top', 0)
+                style = replace(PRESETS['GLOBO'])
+                item = StrokeTextItem(text_str, style, name="IMPORTADO")
+                item._pending_pos = QPointF(left, top)
+                text_items.append(item)
+            except Exception as e:
+                print(f"Error preparando texto importado: {e}")
+                continue
+
+        # Añadir primero los textos (para que queden en la parte superior de la lista), luego las overlays
+        for it in text_items:
+            try: ctx.add_item_and_list(it)
+            except Exception:
+                ctx.scene.addItem(it)
+        for ov in overlay_items:
+            try: ctx.add_item_and_list(ov)
+            except Exception:
+                ctx.scene.addItem(ov)
+        
+        idx = self.tabs.addTab(ctx, f"{Path(fname).stem} (PSD)")
+        self.tabs.setCurrentIndex(idx)
+        num_images = len(image_layers)
+        self.statusBar().showMessage(f"PSD cargado: {Path(fname).name} - {num_images} imagen(es) + {len(text_layers)} texto(s)")
+        
+        # No guardamos ruta de guardado automático para PSD
+        ctx.has_unsaved_changes = True
         return True
 
     def export_png_current(self):
