@@ -2037,6 +2037,10 @@ class MangaTextTool(QMainWindow):
                     return
                 self.tabs.setCurrentIndex(old_idx)
         
+        # Limpiar referencia RAW asociada a esta pestaña
+        if ctx in self._raw_per_tab:
+            del self._raw_per_tab[ctx]
+        
         # Proceder a cerrar
         self.tabs.removeTab(idx)
         ctx.deleteLater()
@@ -3089,7 +3093,7 @@ class MangaTextTool(QMainWindow):
         for tb in self.findChildren(QToolBar):
             tb.addAction(self.toggle_raw_act); break
 
-        self._raw_per_tab: Dict[int, Optional[QPixmap]] = {}
+        self._raw_per_tab: Dict['PageContext', Optional[QPixmap]] = {}
 
     def _on_raw_visibility_changed(self, visible: bool):
         """Sincroniza la acción del toolbar con el dock RAW,
@@ -3102,10 +3106,10 @@ class MangaTextTool(QMainWindow):
         self.toggle_raw_act.blockSignals(False)
 
     def _on_tab_changed(self, idx: int):
-        pix = self._raw_per_tab.get(idx); self._set_raw_pixmap(pix)
-        # aplica marca de agua al cambiar de pestaña
         ctx = self.tabs.widget(idx)
         if isinstance(ctx, PageContext):
+            pix = self._raw_per_tab.get(ctx); self._set_raw_pixmap(pix)
+            # aplica marca de agua al cambiar de pestaña
             self._apply_wm_to_ctx(ctx)
 
     def _set_raw_pixmap(self, pix: Optional[QPixmap]):
@@ -3119,12 +3123,14 @@ class MangaTextTool(QMainWindow):
         path = files[0]; pix = QPixmap(path)
         if pix.isNull():
             QMessageBox.warning(self, "RAW", "No se pudo cargar la imagen seleccionada."); return
-        idx = self.tabs.currentIndex(); self._raw_per_tab[idx] = pix; self._set_raw_pixmap(pix); self.raw_dock.show()
-        self.statusBar().showMessage(f"Referencia RAW cargada: {Path(path).name}")
+        ctx = self.current_ctx()
+        if ctx:
+            self._raw_per_tab[ctx] = pix; self._set_raw_pixmap(pix); self.raw_dock.show()
+            self.statusBar().showMessage(f"Referencia RAW cargada: {Path(path).name}")
 
     def clear_raw_image(self):
-        idx = self.tabs.currentIndex()
-        if idx in self._raw_per_tab: self._raw_per_tab[idx] = None
+        ctx = self.current_ctx()
+        if ctx and ctx in self._raw_per_tab: self._raw_per_tab[ctx] = None
         self._set_raw_pixmap(None); self.statusBar().showMessage("Referencia RAW borrada")
 
     # ---------- Guardar/Abrir proyecto .bbg ----------
