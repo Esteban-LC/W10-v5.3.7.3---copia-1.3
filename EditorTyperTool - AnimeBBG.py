@@ -2212,7 +2212,7 @@ class MangaTextTool(QMainWindow):
         title.setStyleSheet("color:#f97316; font-size:25px;")
         grid.addWidget(title, 0, 1)
 
-        subtitle = QLabel("© 2025 – versión 5.3.7.3.1")
+        subtitle = QLabel("© 2025 – versión 5.3.8")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet("color:#9ca3af; font-size:12px;")
         grid.addWidget(subtitle, 1, 1)
