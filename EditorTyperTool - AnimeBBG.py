@@ -17,8 +17,10 @@ from typing import Dict, Optional, List, Tuple, Callable
 import socket
 import platform
 from datetime import datetime, timezone
-import webbrowser  # asegúrate de tener esto importado arriba
+import webbrowser
 from pathlib import Path
+import threading
+from queue import Queue
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -29,7 +31,7 @@ from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
     QPixmap, QTextCursor, QTextDocument, QTextOption, QShortcut, QKeySequence,
     QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor, QLinearGradient, QBrush,
-    QFontDatabase
+    QFontDatabase, QTextCharFormat
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsDropShadowEffect, QGraphicsItem,
@@ -56,6 +58,14 @@ try:
 except ImportError:
     PSD_AVAILABLE = False
     print("[WARNING] psd-tools not available. PSD import disabled.")
+
+# Import spell checker for Spanish
+try:
+    from language_tool_python import LanguageTool
+    SPELLCHECK_AVAILABLE = True
+except ImportError:
+    SPELLCHECK_AVAILABLE = False
+    print("[WARNING] language-tool-python not available. Spell checking disabled.")
 
 # Carpeta base del script
 BASE_DIR = Path(__file__).resolve().parent
@@ -2001,6 +2011,352 @@ class AboutDialog(QDialog):
         btns.rejected.connect(self.reject)
         main.addWidget(btns)
 
+# -------- QTextEdit con verificación ortográfica en hilo separado --------
+class SpellCheckTextEdit(QTextEdit):
+    """QTextEdit personalizado con verificación ortográfica asíncrona para español"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.spell_checker = None
+        self.errors = []
+        self.error_positions = {}  # Almacena posiciones de errores
+        self.check_thread = None
+        self.checking = False
+        self.pending_check = False
+        self.debounce_timer = None  # Timer para debounce
+        
+        # Inicializar Language Tool si está disponible
+        if SPELLCHECK_AVAILABLE:
+            try:
+                self.spell_checker = LanguageTool('es-ES')  # Spanish
+                print("[INFO] LanguageTool inicializado para español")
+            except Exception as e:
+                print(f"[WARNING] No se pudo inicializar LanguageTool: {e}")
+                self.spell_checker = None
+        
+        # Conectar eventos
+        self.textChanged.connect(self._on_text_changed_debounced)
+        self.cursorPositionChanged.connect(self._update_cursor_info)
+    
+    def _on_text_changed_debounced(self):
+        """Aplica debounce para no verificar cada letra (optimización)"""
+        # Cancelar timer anterior si existe
+        if self.debounce_timer:
+            self.debounce_timer.stop()
+        
+        # Crear nuevo timer con 500ms de retraso
+        self.debounce_timer = QTimer()
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.timeout.connect(self._on_text_changed)
+        self.debounce_timer.start(500)  # 500ms de espera
+    
+    def _on_text_changed(self):
+        """Inicia verificación en hilo separado (no bloquea la UI)"""
+        if not self.spell_checker:
+            return
+        
+        # Si ya hay una verificación en curso, marcar para verificar después
+        if self.checking:
+            self.pending_check = True
+            return
+        
+        self.pending_check = False
+        self.checking = True
+        
+        # Obtener texto actual
+        text = self.toPlainText()
+        
+        # Iniciar verificación en hilo separado
+        self.check_thread = threading.Thread(target=self._check_spelling_thread, args=(text,), daemon=True)
+        self.check_thread.start()
+    
+    def _check_spelling_thread(self, text: str):
+        """Verifica ortografía en hilo separado (no bloquea la UI)"""
+        try:
+            if not text.strip():
+                self.errors = []
+                self.error_positions = {}
+                QTimer.singleShot(0, self._clear_highlights)
+                self.checking = False
+                if self.pending_check:
+                    self._on_text_changed()
+                return
+            
+            # Obtener todos los errores del texto (ESTO ES LO QUE TOMA TIEMPO)
+            errors = self.spell_checker.check(text)
+            error_positions = {}
+            
+            # Mapear posiciones de errores
+            for error in errors:
+                start = error.offset
+                end = error.offset + error.errorLength
+                error_positions[start] = (end, error)
+            
+            # Guardar resultados
+            self.errors = errors
+            self.error_positions = error_positions
+            
+            # Actualizar highlights en el hilo principal
+            QTimer.singleShot(0, self._highlight_misspelled)
+            
+        except Exception as e:
+            print(f"[ERROR] Error al verificar ortografía: {e}")
+            self.errors = []
+            self.error_positions = {}
+            QTimer.singleShot(0, self._clear_highlights)
+        finally:
+            self.checking = False
+            if self.pending_check:
+                QTimer.singleShot(100, self._on_text_changed)
+    
+    def _highlight_misspelled(self):
+        """Resalta las palabras mal escritas con subrayado rojo"""
+        doc = self.document()
+        cursor = QTextCursor(doc)
+        
+        # Limpiar todos los formatos
+        cursor.select(QTextCursor.SelectionType.Document)
+        fmt = cursor.charFormat()
+        fmt.setUnderlineStyle(QTextCharFormat.UnderlineStyle.NoUnderline)  # Remover subrayado
+        cursor.setCharFormat(fmt)
+        
+        # Aplicar subrayado rojo a palabras mal escritas
+        for start_pos, (end_pos, error) in self.error_positions.items():
+            cursor = QTextCursor(doc)
+            cursor.setPosition(start_pos)
+            cursor.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
+            
+            fmt = cursor.charFormat()
+            fmt.setUnderlineColor(QColor("#EF4444"))  # Rojo
+            fmt.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)  # Wavy underline
+            cursor.setCharFormat(fmt)
+    
+    def _clear_highlights(self):
+        """Limpia todos los resaltados"""
+        doc = self.document()
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.SelectionType.Document)
+        fmt = cursor.charFormat()
+        fmt.setUnderlineStyle(QTextCharFormat.UnderlineStyle.NoUnderline)
+        cursor.setCharFormat(fmt)
+    
+    def _update_cursor_info(self):
+        """Muestra sugerencias de palabras cuando el cursor está sobre una palabra"""
+        if not self.spell_checker or not self.errors:
+            return
+        
+        try:
+            cursor_pos = self.textCursor().position()
+            
+            # Buscar el error en la posición actual del cursor
+            for start_pos, (end_pos, error) in self.error_positions.items():
+                if start_pos <= cursor_pos <= end_pos:
+                    # Encontramos un error bajo el cursor
+                    suggestions = error.replacements[:5] if error.replacements else []
+                    word_text = self.toPlainText()[start_pos:end_pos]
+                    
+                    if suggestions:
+                        # Mostrar sugerencias en la barra de estado
+                        parent = self.parent()
+                        while parent and not isinstance(parent, QMainWindow):
+                            parent = parent.parent()
+                        
+                        if isinstance(parent, QMainWindow):
+                            sugg_text = ', '.join(suggestions)
+                            parent.statusBar().showMessage(f'"{word_text}" → {sugg_text}', 3000)
+                    break
+        
+        except Exception:
+            pass  # Ignorar errores
+    
+    def get_errors_with_suggestions(self) -> dict:
+        """Retorna diccionario de errores con sus sugerencias"""
+        corrections = {}
+        text = self.toPlainText()
+        
+        for start_pos, (end_pos, error) in self.error_positions.items():
+            word = text[start_pos:end_pos]
+            suggestions = error.replacements[:5] if error.replacements else []
+            if suggestions:
+                corrections[word] = suggestions
+        
+        return corrections
+    
+    def apply_replacement(self, start_pos: int, end_pos: int, replacement: str):
+        """Aplica un reemplazo en el texto"""
+        doc = self.document()
+        cursor = QTextCursor(doc)
+        cursor.setPosition(start_pos)
+        cursor.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(replacement)
+
+# -------- Diálogo para corrección ortográfica --------
+class SpellCheckDialog(QDialog):
+    """Diálogo para revisar y corregir errores ortográficos"""
+    
+    def __init__(self, text_edit: SpellCheckTextEdit, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Corrección Ortográfica")
+        self.setGeometry(100, 100, 600, 400)
+        self.text_edit = text_edit
+        self.corrections_applied = {}
+        
+        layout = QVBoxLayout(self)
+        
+        # Información
+        info_label = QLabel("Palabras con errores ortográficos detectadas:")
+        layout.addWidget(info_label)
+        
+        # Area de sugerencias
+        self.suggestion_list = QListWidget()
+        layout.addWidget(self.suggestion_list)
+        
+        # Controles de corrección
+        controls = QHBoxLayout()
+        
+        self.word_label = QLabel("")
+        controls.addWidget(self.word_label)
+        
+        self.suggestion_combo = QComboBox()
+        controls.addWidget(self.suggestion_combo)
+        
+        self.replace_btn = QPushButton("Reemplazar")
+        self.replace_btn.clicked.connect(self._replace_word)
+        controls.addWidget(self.replace_btn)
+        
+        self.replace_all_btn = QPushButton("Reemplazar todo")
+        self.replace_all_btn.clicked.connect(self._replace_all_word)
+        controls.addWidget(self.replace_all_btn)
+        
+        self.ignore_btn = QPushButton("Ignorar")
+        self.ignore_btn.clicked.connect(self._ignore_word)
+        controls.addWidget(self.ignore_btn)
+        
+        layout.addLayout(controls)
+        
+        # Botones finales
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+        
+        # Cargar palabras mal escritas
+        self._populate_misspelled_words()
+    
+    def _populate_misspelled_words(self):
+        """Carga las palabras mal escritas en la lista"""
+        corrections = self.text_edit.get_errors_with_suggestions()
+        
+        if not corrections:
+            QMessageBox.information(self, "Corrección Ortográfica", "¡No hay errores ortográficos!")
+            self.reject()
+            return
+        
+        self.error_dict = {}  # Mapeo de palabra a (start_pos, end_pos, error_obj)
+        
+        for (start_pos, (end_pos, error)), (word, suggestions) in zip(
+            self.text_edit.error_positions.items(), 
+            corrections.items()
+        ):
+            item = QListWidgetItem(f"{word}  →  {', '.join(suggestions[:3])}")
+            item.setData(Qt.ItemDataRole.UserRole, word)
+            item.setData(Qt.ItemDataRole.UserRole + 1, suggestions)
+            item.setData(Qt.ItemDataRole.UserRole + 2, (start_pos, end_pos, error))
+            self.suggestion_list.addItem(item)
+            self.error_dict[word] = (start_pos, end_pos, error)
+        
+        # Seleccionar el primer error
+        if self.suggestion_list.count() > 0:
+            self.suggestion_list.setCurrentRow(0)
+            self._on_word_selected(0)
+        
+        self.suggestion_list.itemSelectionChanged.connect(
+            lambda: self._on_word_selected(self.suggestion_list.currentRow())
+        )
+    
+    def _on_word_selected(self, idx):
+        """Cuando se selecciona una palabra de la lista"""
+        if idx < 0:
+            return
+        
+        item = self.suggestion_list.item(idx)
+        if not item:
+            return
+        
+        word = item.data(Qt.ItemDataRole.UserRole)
+        suggestions = item.data(Qt.ItemDataRole.UserRole + 1)
+        
+        self.word_label.setText(f"Palabra: <b>{word}</b>")
+        self.suggestion_combo.clear()
+        self.suggestion_combo.addItems(suggestions if suggestions else [])
+        self.current_error_item = item
+    
+    def _replace_word(self):
+        """Reemplaza solo la ocurrencia actual"""
+        if self.suggestion_list.currentRow() < 0:
+            return
+        
+        item = self.suggestion_list.item(self.suggestion_list.currentRow())
+        word = item.data(Qt.ItemDataRole.UserRole)
+        suggestion = self.suggestion_combo.currentText()
+        
+        if not suggestion:
+            QMessageBox.warning(self, "Error", "Selecciona una sugerencia primero")
+            return
+        
+        # Obtener información del error
+        start_pos, end_pos, error = item.data(Qt.ItemDataRole.UserRole + 2)
+        
+        # Aplicar reemplazo directo en la posición
+        self.text_edit.apply_replacement(start_pos, end_pos, suggestion)
+        
+        self.corrections_applied[word] = suggestion
+        
+        # Remover de la lista y actualizar
+        self.suggestion_list.takeItem(self.suggestion_list.currentRow())
+        
+        if self.suggestion_list.count() == 0:
+            QMessageBox.information(self, "Corrección Ortográfica", "¡Todas las palabras han sido revisadas!")
+            self.accept()
+    
+    def _replace_all_word(self):
+        """Reemplaza todas las ocurrencias de la palabra"""
+        if self.suggestion_list.currentRow() < 0:
+            return
+        
+        item = self.suggestion_list.item(self.suggestion_list.currentRow())
+        word = item.data(Qt.ItemDataRole.UserRole)
+        suggestion = self.suggestion_combo.currentText()
+        
+        if not suggestion:
+            QMessageBox.warning(self, "Error", "Selecciona una sugerencia primero")
+            return
+        
+        # Reemplazar todas las ocurrencias
+        text = self.text_edit.toPlainText()
+        new_text = text.replace(word, suggestion)
+        self.text_edit.setPlainText(new_text)
+        
+        self.corrections_applied[word] = suggestion
+        
+        # Remover de la lista
+        self.suggestion_list.takeItem(self.suggestion_list.currentRow())
+        
+        if self.suggestion_list.count() == 0:
+            QMessageBox.information(self, "Corrección Ortográfica", "¡Todas las palabras han sido revisadas!")
+            self.accept()
+    
+    def _ignore_word(self):
+        """Ignora la palabra actual sin corregir"""
+        if self.suggestion_list.currentRow() >= 0:
+            self.suggestion_list.takeItem(self.suggestion_list.currentRow())
+            
+            if self.suggestion_list.count() == 0:
+                QMessageBox.information(self, "Corrección Ortográfica", "¡Todas las palabras han sido revisadas!")
+                self.accept()
+
 # ---------------- Ventana principal ----------------
 class MangaTextTool(QMainWindow):
     def __init__(self, username: str = ""):
@@ -2463,103 +2819,79 @@ class MangaTextTool(QMainWindow):
 
     def _build_right_panel(self):
         self.prop_dock = QDockWidget("Propiedades", self)
-        w = QWidget(); layout = QFormLayout(w)
+        
+        # === Panel colapsable al estilo Photoshop ===
+        self.prop_panel = QWidget()
+        prop_panel_layout = QVBoxLayout(self.prop_panel)
+        prop_panel_layout.setContentsMargins(0, 0, 0, 0)
+        prop_panel_layout.setSpacing(0)
+
+        # Botón toggle para colapsar
+        self.prop_toggle_btn = QToolButton(self.prop_panel)
+        self.prop_toggle_btn.setCheckable(True)
+        self.prop_toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.prop_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
+        self.prop_toggle_btn.setFixedWidth(24)
+        self.prop_toggle_btn.toggled.connect(self.toggle_prop_panel)
+        prop_panel_layout.addWidget(self.prop_toggle_btn, 0)
+
+        # Contenedor de propiedades (se puede ocultar)
+        self.prop_content_widget = QWidget()
+        prop_content_layout = QVBoxLayout(self.prop_content_widget)
+        prop_content_layout.setContentsMargins(4, 4, 4, 4)
+        prop_content_layout.setSpacing(4)
+
+        # === CONTENIDO ORIGINAL DEL PANEL ===
+        w = QWidget()
+        layout = QFormLayout(w)
         self.prop_dock.setObjectName("PropDock")
 
-        # Etiqueta del panel
-        self.symb_combo = QComboBox(); self.symb_combo.addItems(list(PRESETS.keys())); self.symb_combo.currentIndexChanged.connect(self.on_symbol_changed)
-        layout.addRow("Simbología", self.symb_combo)
-
+        self.symb_combo = QComboBox(); self.symb_combo.addItems(list(PRESETS.keys())); self.symb_combo.currentIndexChanged.connect(self.on_symbol_changed); layout.addRow("Simbología", self.symb_combo)
         self.width_spin = QSpinBox(); self.width_spin.setRange(50, 2000); self.width_spin.valueChanged.connect(self.on_width_changed); layout.addRow("Ancho caja", self.width_spin)
-
-        # Negrita
-        self.bold_chk = QCheckBox("Negrita (toda la caja)")
-        self.bold_chk.setToolTip("Aplica negrita a toda la caja de texto")
-        self.bold_chk.stateChanged.connect(self.on_bold_toggle)
-        layout.addRow(self.bold_chk)
         
-        # Botón para negrita selectiva
-        self.bold_sel_btn = QPushButton("Negrita selectiva (Ctrl+B)")
-        self.bold_sel_btn.setToolTip("Haz doble clic en la caja de texto, selecciona el texto que quieres en negrita y presiona este botón o Ctrl+B")
-        self.bold_sel_btn.clicked.connect(self.apply_bold_to_current_selection)
-        layout.addRow(self.bold_sel_btn)
+        self.bold_chk = QCheckBox("Negrita (toda la caja)"); self.bold_chk.setToolTip("Aplica negrita a toda la caja de texto"); self.bold_chk.stateChanged.connect(self.on_bold_toggle); layout.addRow(self.bold_chk)
+        
+        self.bold_sel_btn = QPushButton("Negrita selectiva (Ctrl+B)"); self.bold_sel_btn.setToolTip("Haz doble clic en la caja de texto, selecciona el texto que quieres en negrita y presiona este botón o Ctrl+B"); self.bold_sel_btn.clicked.connect(self.apply_bold_to_current_selection); layout.addRow(self.bold_sel_btn)
         
         self.font_btn = QPushButton("Elegir fuente…"); self.font_btn.clicked.connect(self.choose_font); layout.addRow("Fuente (caja)", self.font_btn)
         self.fill_btn = QPushButton("Color texto…"); self.fill_btn.clicked.connect(lambda: self.choose_color('fill')); layout.addRow("Color", self.fill_btn)
         self.out_btn = QPushButton("Color trazo…"); self.out_btn.clicked.connect(lambda: self.choose_color('outline')); layout.addRow("Trazo", self.out_btn)
-
-
-        self.no_stroke_chk = QCheckBox("Sin trazo"); self.no_stroke_chk.stateChanged.connect(self.on_no_stroke_toggle); layout.addRow(self.no_stroke_chk)
         
-        # Grosor trazo con slider
-        outw_layout = QHBoxLayout()
-        self.outw_slider = QSlider(Qt.Orientation.Horizontal)
-        self.outw_slider.setRange(0, 40)
-        self.outw_slider.setValue(3)
-        self.outw_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.outw_slider.setTickInterval(5)
-        self.outw_label = QLabel("3")
-        self.outw_label.setMinimumWidth(40)
-        self.outw_slider.valueChanged.connect(lambda v: (self.outw_label.setText(str(v)), self.on_outline_width(v)))
-        outw_layout.addWidget(self.outw_slider)
-        outw_layout.addWidget(self.outw_label)
-        layout.addRow("Grosor trazo", outw_layout)
-
-
+        self.no_stroke_chk = QCheckBox("Sin trazo"); self.no_stroke_chk.stateChanged.connect(self.on_no_stroke_toggle); layout.addRow(self.no_stroke_chk)
+        self.outw_slider = QSlider(Qt.Orientation.Horizontal); self.outw_slider.setRange(0, 40); self.outw_slider.setValue(3); self.outw_slider.valueChanged.connect(self.on_outline_width); layout.addRow("Grosor trazo", self.outw_slider)
         self.shadow_chk = QCheckBox("Sombra"); self.shadow_chk.stateChanged.connect(self.on_shadow_toggle); layout.addRow(self.shadow_chk)
 
         self.bg_chk = QCheckBox("Fondo caja"); self.bg_chk.stateChanged.connect(self.on_bg_toggle); layout.addRow(self.bg_chk)
         self.bg_btn = QPushButton("Color fondo…"); self.bg_btn.clicked.connect(lambda: self.choose_color('background_color')); layout.addRow("Color fondo", self.bg_btn)
-        self.bg_op = QSlider(Qt.Orientation.Horizontal); self.bg_op.setRange(0,100); self.bg_op.valueChanged.connect(self.on_bg_op); layout.addRow("Opacidad fondo", self.bg_op)
+        self.bg_op = QSlider(Qt.Orientation.Horizontal); self.bg_op.setRange(0,100); self.bg_op.setValue(100); self.bg_op.valueChanged.connect(self.on_bg_op); layout.addRow("Opacidad fondo", self.bg_op)
 
-        self.align_combo = QComboBox(); self.align_combo.addItems(["Izquierda", "Centro", "Derecha", "Justificar"]); self.align_combo.setCurrentIndex(1)
-        self.align_combo.currentIndexChanged.connect(self.on_alignment_changed); layout.addRow("Alineación", self.align_combo)
+        self.align_combo = QComboBox(); self.align_combo.addItems(["Izquierda", "Centro", "Derecha", "Justificar"]); self.align_combo.setCurrentIndex(1); self.align_combo.currentIndexChanged.connect(self.on_alignment_changed); layout.addRow("Alineación", self.align_combo)
 
         # Interlineado con slider
-        linespace_layout = QHBoxLayout()
-        self.linespace_slider = QSlider(Qt.Orientation.Horizontal)
-        self.linespace_slider.setRange(80, 300)  # 0.8 a 3.0 multiplicado por 100
-        self.linespace_slider.setValue(120)  # 1.2 por defecto
-        self.linespace_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.linespace_slider.setTickInterval(20)
-        self.linespace_label = QLabel("1.20")
-        self.linespace_label.setMinimumWidth(40)
-        self.linespace_slider.valueChanged.connect(lambda v: (self.linespace_label.setText(f"{v/100:.2f}"), self.on_linespacing_changed(v/100)))
-        linespace_layout.addWidget(self.linespace_slider)
-        linespace_layout.addWidget(self.linespace_label)
-        layout.addRow("Interlineado", linespace_layout)
+        self.linespace_slider = QSlider(Qt.Orientation.Horizontal); self.linespace_slider.setRange(80, 300); self.linespace_slider.setValue(120); self.linespace_slider.valueChanged.connect(lambda v: self.on_linespacing_changed(v/100)); layout.addRow("Interlineado", self.linespace_slider)
 
-        # Rotación con slider
-        rotate_layout = QHBoxLayout()
-        self.rotate_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rotate_slider.setRange(-180, 180)
-        self.rotate_slider.setValue(0)
-        self.rotate_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.rotate_slider.setTickInterval(45)
-        self.rotate_label = QLabel("0°")
-        self.rotate_label.setMinimumWidth(40)
-        self.rotate_slider.valueChanged.connect(lambda v: (self.rotate_label.setText(f"{v}°"), self.on_rotation_changed(float(v))))
-        rotate_layout.addWidget(self.rotate_slider)
-        rotate_layout.addWidget(self.rotate_label)
-        layout.addRow("Rotación", rotate_layout)
+        # Rotación
+        self.rotate_slider = QSlider(Qt.Orientation.Horizontal); self.rotate_slider.setRange(-180, 180); self.rotate_slider.setValue(0); self.rotate_slider.valueChanged.connect(lambda v: self.on_rotation_changed(float(v))); layout.addRow("Rotación", self.rotate_slider)
 
-        self.cap_combo = QComboBox(); self.cap_combo.addItems(["Normal", "MAYÚSCULAS", "minúsculas"])
-        self.cap_combo.currentIndexChanged.connect(self.on_capitalization_changed); layout.addRow("Cambiar letras", self.cap_combo)
+        # Capitalización
+        self.cap_combo = QComboBox(); self.cap_combo.addItems(["Normal", "MAYÚSCULAS", "minúsculas"]); self.cap_combo.currentIndexChanged.connect(self.on_capitalization_changed); layout.addRow("Mayús/minús", self.cap_combo)
 
-        # ---- Marca de agua (opcional y persistente) ----
-        self.wm_enable_chk = QCheckBox("Usar marca de agua")
-        self.wm_enable_chk.toggled.connect(self.on_wm_enable_toggled)
-        layout.addRow(self.wm_enable_chk)
+        self.wm_enable_chk = QCheckBox("Usar marca de agua"); self.wm_enable_chk.toggled.connect(self.on_wm_enable_toggled); layout.addRow(self.wm_enable_chk)
+        self.wm_pick_btn = QPushButton("Elegir imagen…"); self.wm_pick_btn.clicked.connect(self.choose_wm_image); layout.addRow("Marca de agua", self.wm_pick_btn)
+        self.wm_op_slider = QSlider(Qt.Orientation.Horizontal); self.wm_op_slider.setRange(0, 100); self.wm_op_slider.setValue(100); self.wm_op_slider.valueChanged.connect(self.on_wm_opacity_changed); layout.addRow("Opacidad marca", self.wm_op_slider)
 
-        self.wm_pick_btn = QPushButton("Elegir imagen…")
-        self.wm_pick_btn.clicked.connect(self.choose_wm_image)
-        layout.addRow("Marca de agua", self.wm_pick_btn)
+        # Agregar contenido al contenedor
+        prop_content_layout.addWidget(w)
+        prop_content_layout.addStretch()
+        
+        # Agregar contenedor al panel principal
+        prop_panel_layout.addWidget(self.prop_content_widget, 1)
 
-        self.wm_op_slider = QSlider(Qt.Orientation.Horizontal); self.wm_op_slider.setRange(0, 100)
-        self.wm_op_slider.valueChanged.connect(self.on_wm_opacity_changed)
-        layout.addRow("Opacidad marca", self.wm_op_slider)
-
-        self.prop_dock.setWidget(w); self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.prop_dock)
+        # Ancho máximo cuando está expandido
+        self.prop_panel.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+        
+        self.prop_dock.setWidget(self.prop_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.prop_dock)
         try:
             self.prop_dock.visibilityChanged.connect(self._on_prop_visibility_changed)
             for tb in self.findChildren(QToolBar):
@@ -2577,6 +2909,22 @@ class MangaTextTool(QMainWindow):
         self.toggle_props_act.blockSignals(True)
         self.toggle_props_act.setChecked(visible)
         self.toggle_props_act.blockSignals(False)
+
+    def toggle_prop_panel(self, checked: bool):
+        """Colapsa/expande el panel de propiedades al estilo Photoshop."""
+        if checked:
+            # Colapsado: solo la tirita con el botón
+            self.prop_content_widget.hide()
+            # Ancho reducido, casi solo el botón
+            self.prop_panel.setMaximumWidth(self.prop_toggle_btn.width() + 8)
+            # Flecha hacia la izquierda ◀ (indica que se puede expandir)
+            self.prop_toggle_btn.setArrowType(Qt.ArrowType.LeftArrow)
+        else:
+            # Expandido: se ve el contenido completo
+            self.prop_content_widget.show()
+            self.prop_panel.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+            # Flecha hacia la derecha ▶ (indica que se puede colapsar)
+            self.prop_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
 
     # ---------------- Acciones principales ----------------
     def open_images(self):
@@ -2619,10 +2967,24 @@ class MangaTextTool(QMainWindow):
         ctx = self.current_ctx()
         if not ctx: QMessageBox.information(self, "Sin pestaña", "Abre una imagen antes de pegar texto."); return
         dlg = QDialog(self); dlg.setWindowTitle("Pegar texto – una línea por caja")
+        dlg.setMinimumWidth(600)
+        dlg.setMinimumHeight(400)
         v = QVBoxLayout(dlg)
         v.addWidget(QLabel("Identificadores (opcionales): Globo 1:, N/T:, *:, ():, (texto), []:, [texto].\n`//` crea ANIDADO inline. (Se quita el identificador)."))
-        te = QTextEdit(); te.setPlaceholderText("Globo 1: Texto...\n(): Pensamiento\n[Nota en cuadro]")
+        
+        # Usar SpellCheckTextEdit en lugar de QTextEdit
+        te = SpellCheckTextEdit(); te.setPlaceholderText("Globo 1: Texto...\n(): Pensamiento\n[Nota en cuadro]")
         te.setPlainText(QGuiApplication.clipboard().text()); v.addWidget(te)
+        
+        # Botones de corrección ortográfica
+        spell_check_controls = QHBoxLayout()
+        spell_check_btn = QPushButton("🔍 Revisar Ortografía")
+        spell_check_btn.setToolTip("Verifica y corrige errores ortográficos")
+        spell_check_btn.clicked.connect(lambda: self._open_spellcheck_dialog(te))
+        spell_check_controls.addStretch()
+        spell_check_controls.addWidget(spell_check_btn)
+        v.addLayout(spell_check_controls)
+        
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel); v.addWidget(bb)
         bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
         if dlg.exec() != QDialog.DialogCode.Accepted: return
@@ -2638,6 +3000,24 @@ class MangaTextTool(QMainWindow):
                 style = PRESETS.get(use_preset, PRESETS['GLOBO'])
                 item = StrokeTextItem(seg, replace(style), name=use_preset)
                 item.setFont(item.style.to_qfont()); self._push_add_command(ctx, item, QPointF(50, y)); y += 70
+    
+    def _open_spellcheck_dialog(self, text_edit: SpellCheckTextEdit):
+        """Abre el diálogo de corrección ortográfica"""
+        if not SPELLCHECK_AVAILABLE:
+            QMessageBox.warning(
+                self,
+                "Función no disponible",
+                "El corrector ortográfico no está disponible.\n"
+                "Instala: pip install pyspellchecker"
+            )
+            return
+        
+        # Forzar una verificación
+        text_edit._on_text_changed()
+        
+        # Abrir diálogo
+        spell_dlg = SpellCheckDialog(text_edit, self)
+        spell_dlg.exec()
 
     # ---------------- Workflow Automático ----------------
     def start_automated_workflow(self):

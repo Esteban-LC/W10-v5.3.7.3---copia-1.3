@@ -2,3 +2,8 @@
 # (PyInstaller <6.10 no soporta 3.13; usa >=6.10)
 pyinstaller>=6.10,<6.17
 PyQt6>=6.6
+language-tool-python>=2.7.1
+psd-tools>=1.12.1
+gspread>=6.1.0
+oauth2client>=4.1.3
+Pillow>=10.0.0
