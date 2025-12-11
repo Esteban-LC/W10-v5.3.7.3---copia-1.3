@@ -2170,21 +2170,48 @@ class SpellCheckTextEdit(QTextEdit):
             pass  # Ignorar errores
     
     def get_errors_with_suggestions(self) -> dict:
-        """Retorna diccionario de errores con sus sugerencias"""
+        """Retorna diccionario de errores con sus sugerencias, incluyendo sugerencias personalizadas"""
         corrections = {}
         text = self.toPlainText()
-        
+        # Sugerencias personalizadas para palabras y frases frecuentes
+        custom_suggestions = {
+            'muxa': ['mucho', 'muda', 'mula', 'musa'],
+            'muxo': ['mucho', 'mudo', 'muxa'],
+            'muxos': ['muchos', 'mucho'],
+            'desde ase': ['desde hace', 'desde ese', 'desde hace tiempo'],
+            'ase': ['hace', 'ase'],
+        }
         for start_pos, (end_pos, error) in self.error_positions.items():
             word = text[start_pos:end_pos]
             suggestions = error.replacements[:5] if error.replacements else []
+            # Si hay sugerencias personalizadas, las agregamos al inicio
+            if word in custom_suggestions:
+                # Evitar duplicados
+                custom = [s for s in custom_suggestions[word] if s not in suggestions]
+                suggestions = custom + suggestions
             if suggestions:
                 corrections[word] = suggestions
-        
         return corrections
     
     def apply_replacement(self, start_pos: int, end_pos: int, replacement: str):
-        """Aplica un reemplazo en el texto"""
+        """Aplica un reemplazo en el texto, asegurando que cubre toda la palabra incorrecta"""
         doc = self.document()
+        text = self.toPlainText()
+        # Obtener el texto actual en el rango
+        word_in_range = text[start_pos:end_pos]
+        # Si el rango no cubre toda la palabra, expandir a los límites de la palabra
+        import re
+        # Buscar el inicio de la palabra
+        word_start = start_pos
+        while word_start > 0 and re.match(r'\w', text[word_start-1]):
+            word_start -= 1
+        # Buscar el final de la palabra
+        word_end = end_pos
+        while word_end < len(text) and re.match(r'\w', text[word_end]):
+            word_end += 1
+        # Usar el rango expandido si es diferente
+        if (word_start != start_pos) or (word_end != end_pos):
+            start_pos, end_pos = word_start, word_end
         cursor = QTextCursor(doc)
         cursor.setPosition(start_pos)
         cursor.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
