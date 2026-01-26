@@ -5,7 +5,7 @@ a = Analysis(
     ['EditorTyperTool - AnimeBBG.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets\\icons', 'assets\\icons')],
+    datas=[('assets\\icons', 'assets\\icons'), ('es.json.gz', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

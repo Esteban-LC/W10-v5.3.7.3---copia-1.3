@@ -12,6 +12,8 @@ Cambios vs v3.29:
 from __future__ import annotations
 from dataclasses import dataclass, asdict, replace
 import json, math, sys, re, os, base64
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Callable
 import socket
@@ -25,13 +27,13 @@ from queue import Queue
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer
+from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
     QPixmap, QTextCursor, QTextDocument, QTextOption, QShortcut, QKeySequence,
     QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor, QLinearGradient, QBrush,
-    QFontDatabase, QTextCharFormat
+    QFontDatabase, QTextCharFormat, QAbstractTextDocumentLayout, QPalette
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsDropShadowEffect, QGraphicsItem,
@@ -51,6 +53,13 @@ except ImportError:
     WORKFLOW_AVAILABLE = False
     print("[WARNING] automated_workflow module not found. Workflow features disabled.")
 
+# Import pyspellchecker for Spanish
+try:
+    from spellchecker import SpellChecker
+    SPELLCHECK_AVAILABLE = True
+except ImportError:
+    SPELLCHECK_AVAILABLE = False
+    print("[WARNING] pyspellchecker not available. Spell checking disabled.")
 # Import PSD support
 try:
     from psd_tools import PSDImage
@@ -59,13 +68,7 @@ except ImportError:
     PSD_AVAILABLE = False
     print("[WARNING] psd-tools not available. PSD import disabled.")
 
-# Import spell checker for Spanish
-try:
-    from language_tool_python import LanguageTool
-    SPELLCHECK_AVAILABLE = True
-except ImportError:
-    SPELLCHECK_AVAILABLE = False
-    print("[WARNING] language-tool-python not available. Spell checking disabled.")
+
 
 # Carpeta base del script
 BASE_DIR = Path(__file__).resolve().parent
@@ -79,6 +82,11 @@ ABOUT_LINKS = {
     "DISCORD": "https://discord.gg/knazKVcF",
     "PAYPAL": "https://animebbg.net/pages/donacion/",
 }
+
+# ---- Actualizaciones (GitHub Releases + version.json) ----
+# Actualiza estos valores al publicar una nueva version.
+APP_VERSION = "5.3.8"
+UPDATE_JSON_URL = "https://raw.githubusercontent.com/Esteban-LC/W10-v5.3.7.3---copia-1.3/main/version.json"
 
 GSPREAD_CREDS = {
   "type": "service_account",
@@ -244,12 +252,34 @@ def qcolor_from_hex(s: str, default: str = "#000000") -> QColor:
 
 def clamp(v, a, b): return max(a, min(v, b))
 
+# ---- Update helpers ----
+def _parse_version(v: str) -> Tuple[int, ...]:
+    nums = re.findall(r'\d+', v or "")
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+def _is_newer_version(remote: str, local: str) -> bool:
+    r = _parse_version(remote)
+    l = _parse_version(local)
+    # Normalize lengths for comparison
+    max_len = max(len(r), len(l))
+    r += (0,) * (max_len - len(r))
+    l += (0,) * (max_len - len(l))
+    return r > l
+
 # ---- Font Utilities ----
 def is_font_installed(family_name: str) -> bool:
     """Verifica si una fuente está instalada en el sistema."""
-    db = QFontDatabase()
-    families = db.families()
-    return family_name in families
+    families = QFontDatabase.families()
+    if family_name in families:
+        return True
+    
+    # Intento de búsqueda flexible para nombres como "Familia-Estilo"
+    if "-" in family_name:
+        base = family_name.split("-")[0]
+        if base in families:
+            return True
+            
+    return False
 
 def get_safe_font_family(requested_family: str, fallback: str = "Arial") -> str:
     """Devuelve el nombre de la fuente solicitada si está disponible, sino el fallback."""
@@ -655,6 +685,7 @@ class MovableImageLayer(QGraphicsPixmapItem):
 # ---------------- Ítem de texto ----------------
 class StrokeTextItem(QGraphicsTextItem):
     HANDLE_SIZE = 10; ROT_HANDLE_R = 7
+    SHOW_ORDINAL = True
     def __init__(self, text: str, style: TextStyle, name: str = "Texto"):
         super().__init__(text)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -715,13 +746,18 @@ class StrokeTextItem(QGraphicsTextItem):
     def boundingRect(self) -> QRectF:
         rect = super().boundingRect(); pad = self.style.outline_width + 4
         if self.isSelected():
-            extra_top = 20; handle_pad = self.HANDLE_SIZE + 2
+            # Aumentar espacio superior para evitar clipping de la palanca de rotación
+            extra_top = 50; handle_pad = self.HANDLE_SIZE + 2
             rect = rect.adjusted(-pad, -pad - extra_top, pad + handle_pad, pad + handle_pad)
         else:
             rect = rect.adjusted(-pad, -pad, pad, pad)
         return rect
 
     def paint(self, painter: QPainter, option, widget=None):
+        # Ocultar el cuadro de selección predeterminado (linea punteada blanca)
+        # Esto elimina el ruido visual del boundingRect extendido.
+        option.state &= ~QStyle.StateFlag.State_Selected
+
         if self.style.background_enabled and self.style.background_opacity > 0:
             br = super().boundingRect()
             c = QColor(qcolor_from_hex(self.style.background_color))
@@ -731,9 +767,6 @@ class StrokeTextItem(QGraphicsTextItem):
         ow = int(max(0, round(float(self.style.outline_width))))
         if ow > 0:
             outline_col = qcolor_from_hex(self.style.outline)
-            # Rasterizar el texto una vez con el color de contorno y luego dibujar esa imagen
-            # desplazada en los offsets necesarios. Esto evita llamar a super().paint muchas veces
-            # (costoso) y suele ser mucho más rápido.
             br = super().boundingRect()
             pad = ow
             img_w = max(1, int(math.ceil(br.width())) + pad * 2)
@@ -743,98 +776,90 @@ class StrokeTextItem(QGraphicsTextItem):
 
             img_p = QPainter(img)
             img_p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            # Preparar contexto para que super().paint dibuje en la posición correcta dentro de la imagen
             img_p.translate(pad - br.left(), pad - br.top())
-            # Poner color de contorno temporalmente
-            prev_color = self.defaultTextColor()
-            self.setDefaultTextColor(outline_col)
-            super().paint(img_p, option, widget)
-            self.setDefaultTextColor(prev_color)
+            
+            # Use PaintContext to draw with outline color without modifying item state
+            ctx = QAbstractTextDocumentLayout.PaintContext()
+            ctx.palette.setColor(QPalette.ColorRole.Text, outline_col)
+            self.document().documentLayout().draw(img_p, ctx)
+            
             img_p.end()
 
-            # Dibujar la imagen de contorno muestreada en offsets (densidad limitada)
+            # Dibujar la imagen muestreada
             max_samples = 11
-            if ow <= max_samples:
-                step = 1
-            else:
-                step = max(1, ow // max_samples)
-
+            step = 1 if ow <= max_samples else max(1, ow // max_samples)
             base_x = br.left() - pad
             base_y = br.top() - pad
             for dx in range(-ow, ow + 1, step):
                 for dy in range(-ow, ow + 1, step):
-                    if dx == 0 and dy == 0:
-                        continue
+                    if dx == 0 and dy == 0: continue
                     painter.drawImage(QPointF(base_x + dx, base_y + dy), img)
 
-        # Relleno (puede ser sólido, degradado o textura)
+        # Relleno
         try:
-            if getattr(self.style, 'fill_type', 'solid') == 'solid':
-                self.setDefaultTextColor(qcolor_from_hex(self.style.fill)); super().paint(painter, option, widget)
+            target_fill = qcolor_from_hex(self.style.fill)
+            fill_type = getattr(self.style, 'fill_type', 'solid')
+            
+            if fill_type == 'solid':
+                # For solid, we use standard paint, but check if color needs update to avoid loops
+                if self.defaultTextColor() != target_fill:
+                    self.setDefaultTextColor(target_fill)
+                super().paint(painter, option, widget)
             else:
-                # Obtener rect y dimensiones
                 br = super().boundingRect()
                 pad = 2
                 w = max(1, int(math.ceil(br.width())))
                 h = max(1, int(math.ceil(br.height())))
 
+                # Mask Image (Text in White)
                 mask_img = QImage(w + pad*2, h + pad*2, QImage.Format.Format_ARGB32_Premultiplied)
                 mask_img.fill(Qt.GlobalColor.transparent)
                 mp = QPainter(mask_img)
                 mp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 mp.translate(pad - br.left(), pad - br.top())
-                # Dibujar texto en blanco para crear máscara alfa
-                prev_col = self.defaultTextColor()
-                self.setDefaultTextColor(QColor('white'))
-                super().paint(mp, option, widget)
-                self.setDefaultTextColor(prev_col)
+                
+                # Draw Mask without state mutation
+                ctx = QAbstractTextDocumentLayout.PaintContext()
+                ctx.palette.setColor(QPalette.ColorRole.Text, QColor('white'))
+                self.document().documentLayout().draw(mp, ctx)
                 mp.end()
 
-                # Crear imagen de relleno
+                # Fill Image
                 fill_img = QImage(mask_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
                 fill_img.fill(Qt.GlobalColor.transparent)
                 fp = QPainter(fill_img)
                 fp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-                if self.style.fill_type == 'linear_gradient' and self.style.gradient_stops:
-                    # Crear gradiente lineal simple
+                # Draw Gradient/Texture on Fill Image
+                if fill_type == 'linear_gradient' and self.style.gradient_stops:
                     angle = float(getattr(self.style, 'gradient_angle', 0))
-                    # Coordenadas para gradiente: de izquierda a derecha por defecto
-                    x1 = 0; y1 = 0; x2 = fill_img.width(); y2 = 0
-                    # Rotar vector por angle
                     import math as _math
                     rad = _math.radians(angle)
-                    cx = fill_img.width()/2; cy = fill_img.height()/2
-                    dx = _math.cos(rad) * fill_img.width()/2
-                    dy = _math.sin(rad) * fill_img.height()/2
+                    cx, cy = fill_img.width()/2, fill_img.height()/2
+                    dx = _math.cos(rad) * cx; dy = _math.sin(rad) * cy
                     x1 = cx - dx; y1 = cy - dy; x2 = cx + dx; y2 = cy + dy
                     grad = QLinearGradient(QPointF(x1, y1), QPointF(x2, y2))
                     stops = getattr(self.style, 'gradient_stops', []) or []
-                    # stops expected as list of (pos, hex)
                     for pos, col in stops:
                         try: grad.setColorAt(float(pos), qcolor_from_hex(col))
                         except Exception: pass
                     fp.fillRect(fill_img.rect(), grad)
-
-                elif self.style.fill_type == 'texture' and getattr(self.style, 'texture_path', ''):
+                elif fill_type == 'texture' and getattr(self.style, 'texture_path', ''):
                     tp = getattr(self.style, 'texture_path', '')
                     pm = QPixmap(tp) if tp else QPixmap()
                     if not pm.isNull():
                         if getattr(self.style, 'texture_tile', True):
-                            brush = QBrush(pm)
-                            fp.fillRect(fill_img.rect(), brush)
+                            fp.fillRect(fill_img.rect(), QBrush(pm))
                         else:
-                            # escalar para cubrir
                             s = pm.scaled(fill_img.width(), fill_img.height(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
                             fp.drawPixmap(0, 0, s)
                     else:
-                        fp.fillRect(fill_img.rect(), qcolor_from_hex(self.style.fill))
+                        fp.fillRect(fill_img.rect(), target_fill)
                 else:
-                    fp.fillRect(fill_img.rect(), qcolor_from_hex(self.style.fill))
-
+                    fp.fillRect(fill_img.rect(), target_fill)
                 fp.end()
 
-                # Aplicar máscara alfa: conservar sólo las áreas donde mask_img tiene alfa
+                # Composite
                 result = QImage(fill_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
                 result.fill(Qt.GlobalColor.transparent)
                 rp = QPainter(result)
@@ -844,17 +869,27 @@ class StrokeTextItem(QGraphicsTextItem):
                 rp.drawImage(0, 0, mask_img)
                 rp.end()
 
-                # Dibujar resultado en el painter principal
                 painter.drawImage(QPointF(br.left()-pad, br.top()-pad), result)
+                
+                # Draw selection indicators if selected (since super().paint isn't called)
+                if self.isSelected() or (self.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsFocusable and self.hasFocus()):
+                     # We can't easily draw the exact cursor/selection overlay of QGraphicsTextItem manually
+                     # without super().paint.
+                     # But for gradient text, usually we accept losing the native cursor blink 
+                     # in exchange for the effect.
+                     # However, to support editing, we might want to draw the cursor?
+                     # A workaround: Draw standard paint with composition mode?
+                     # For now, let's leave it as is (visual effect dominates).
+                     pass
+
         except Exception:
-            # Fallback a comportamiento simple si algo falla
-            try:
-                self.setDefaultTextColor(qcolor_from_hex(self.style.fill)); super().paint(painter, option, widget)
-            except Exception:
-                pass
+            # Fallback
+            if self.defaultTextColor() != target_fill:
+                self.setDefaultTextColor(target_fill)
+            super().paint(painter, option, widget)
 
         try:
-            if getattr(self, 'ordinal', -1) >= 0 and not getattr(self, '_suppress_overlays', False):
+            if getattr(self, 'ordinal', -1) >= 0 and not getattr(self, '_suppress_overlays', False) and self.SHOW_ORDINAL:
                 br = super().boundingRect()
                 r = 10
                 center = QPointF(br.left() + r + 6, br.top() + r + 6)
@@ -875,28 +910,42 @@ class StrokeTextItem(QGraphicsTextItem):
             br = super().boundingRect(); acc = accent_qcolor()
             painter.setPen(QPen(acc, 1, Qt.PenStyle.DashLine)); painter.drawRect(br)
             if not self.locked:
-                # ===== HANDLES MÁS VISIBLES CON COLORES BRILLANTES =====
-                # Color brillante para los handles (amarillo/naranja)
-                handle_color = QColor('#FFA500')  # Naranja brillante
+                # FORCE VISIBILITY: Larger handle, Distinct Color
+                painter.setOpacity(1.0)
+                handle_color = QColor('#FF4500') # OrangeRed
                 border_color = QColor('white')
                 
-                # Handle de redimensionamiento (esquina inferior derecha)
-                painter.setPen(QPen(border_color, 2))  # Borde blanco
-                painter.setBrush(handle_color)
+                # Resize Handle
+                painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
                 painter.drawRect(self._handle_rect())
                 
-                # Handle de rotación (círculo superior)
+                # Rotation Handle
                 c = self._rot_handle_center()
-                painter.setPen(QPen(border_color, 2))  # Línea blanca
-                painter.drawLine(QPointF((br.left()+br.right())/2.0, br.top()),
-                                 QPointF(c.x(), c.y()+self.ROT_HANDLE_R))
-                painter.setPen(QPen(border_color, 2))  # Borde blanco del círculo
-                painter.setBrush(handle_color)
+                top_mid = QPointF((br.left()+br.right())/2.0, br.top())
+                
+                # Line
+                painter.setPen(QPen(border_color, 2))
+                painter.drawLine(top_mid, QPointF(c.x(), c.y() + self.ROT_HANDLE_R))
+                
+                # Circle
+                painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
                 painter.drawEllipse(c, self.ROT_HANDLE_R, self.ROT_HANDLE_R)
+                
+                # Desired Symbol? (Arrow) - Optional: simple arrow drawing if needed
+                # For now, let's stick to the ball, but make sure it's drawn LAST
+
 
     def hoverMoveEvent(self, event):
         if self.locked:
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor)); super().hoverMoveEvent(event); return
+        # Hover logic: show open hand if near rotation handle OR if Alt is pressed
+        if (QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier):
+             self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+             # If we want to be super detailed, we could change to a refresh/rotate cursor if available, 
+             # but OpenHand is standard for "ready to grab/rotate" in this context or Arrow is fine.
+             # Actually, let's leave it as OpenHand to indicate interaction.
+             super().hoverMoveEvent(event); return
+
         if self._handle_rect().contains(event.pos()):
             self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
         else:
@@ -917,14 +966,21 @@ class StrokeTextItem(QGraphicsTextItem):
             self._resize_alt_scale = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
             self._start_font_pt = float(self.style.font_point_size); self._start_outline = float(self.style.outline_width)
             event.accept(); return
+        # Rotation on Alt+Drag (anywhere in item) OR Handle Click
+        # Check handle first
+        handle_clicked = False
         c = self._rot_handle_center()
         if (event.pos() - c).manhattanLength() <= self.ROT_HANDLE_R + 3:
+            handle_clicked = True
+
+        if handle_clicked or (QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier):
             self._rotating = True; self._rot_base = self.rotation()
             center_scene = self.mapToScene(super().boundingRect().center())
             pos_scene = self.mapToScene(event.pos())
             self._rot_start_angle = math.degrees(math.atan2(
                 pos_scene.y()-center_scene.y(), pos_scene.x()-center_scene.x()))
             self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor)); event.accept(); return
+        
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -1003,7 +1059,7 @@ class StrokeTextItem(QGraphicsTextItem):
         self._old_text = self.toPlainText()
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
         self.setFocus(Qt.FocusReason.MouseFocusReason)
-        cursor = self.textCursor(); cursor.movePosition(QTextCursor.MoveOperation.End); self.setTextCursor(cursor)
+        # Deja que Qt maneje la posición del cursor según el clic
         super().mouseDoubleClickEvent(event)
 
     def focusOutEvent(self, event):
@@ -2025,30 +2081,295 @@ class SpellCheckTextEdit(QTextEdit):
         self.pending_check = False
         self.debounce_timer = None  # Timer para debounce
         
-        # Inicializar Language Tool si está disponible
-        if SPELLCHECK_AVAILABLE:
-            try:
-                self.spell_checker = LanguageTool('es-ES')  # Spanish
-                print("[INFO] LanguageTool inicializado para español")
-            except Exception as e:
-                print(f"[WARNING] No se pudo inicializar LanguageTool: {e}")
-                self.spell_checker = None
+
         
         # Conectar eventos
         self.textChanged.connect(self._on_text_changed_debounced)
         self.cursorPositionChanged.connect(self._update_cursor_info)
+
+        # Inicializar path del diccionario personalizado
+        if getattr(sys, 'frozen', False):
+            base_dir = Path(sys.executable).parent
+        else:
+            base_dir = Path(__file__).parent
+        self.dict_path = base_dir / "custom_dictionary.json"
+
+        # Palabras comunes que el diccionario por defecto suele marcar como error
+        self.COMMON_MISSING = {
+            # SER
+            'soy', 'eres', 'es', 'somos', 'sois', 'son',
+            'fui', 'fuiste', 'fue', 'fuimos', 'fuisteis', 'fueron',
+            'era', 'eras', 'éramos', 'erais', 'eran',
+            'seré', 'serás', 'será', 'seremos', 'seréis', 'serán',
+            'sería', 'serías', 'seríamos', 'seríais', 'serían',
+            'sido', 'siendo',
+            # ESTAR
+            'estoy', 'estás', 'está', 'estamos', 'estáis', 'están',
+            'estuve', 'estuviste', 'estuvo', 'estuvimos', 'estuvisteis', 'estuvieron',
+            'estaba', 'estabas', 'estábamos', 'estabais', 'estaban',
+            'estaré', 'estarás', 'estará', 'estaremos', 'estaréis', 'estarán',
+            'estaría', 'estarías', 'estaríamos', 'estaríais', 'estarían',
+            'estado', 'estando',
+            # HABER
+            'he', 'has', 'ha', 'hemos', 'habéis', 'han',
+            'hube', 'hubiste', 'hubo', 'hubimos', 'hubisteis', 'hubieron',
+            'había', 'habías', 'habíamos', 'habíais', 'habían',
+            'habré', 'habrás', 'habrá', 'habremos', 'habréis', 'habrán',
+            'habría', 'habrías', 'habríamos', 'habríais', 'habrían',
+            'hay', 'habido', 'habiendo',
+            # TENER
+            'tengo', 'tienes', 'tiene', 'tenemos', 'tenéis', 'tienen',
+            'tuve', 'tuviste', 'tuvo', 'tuvimos', 'tuvisteis', 'tuvieron',
+            'tenía', 'tenías', 'teníamos', 'teníais', 'tenían',
+            'tendré', 'tendrás', 'tendrá', 'tendremos', 'tendréis', 'tendrán',
+            'tendría', 'tendrías', 'tendríamos', 'tendríais', 'tendrían',
+            'tenido', 'teniendo',
+            # HACER
+            'hago', 'haces', 'hace', 'hacemos', 'hacéis', 'hacen',
+            'hice', 'hiciste', 'hizo', 'hicimos', 'hicisteis', 'hicieron',
+            'hacía', 'hacías', 'hacíamos', 'hacíais', 'hacían',
+            'haré', 'harás', 'hará', 'haremos', 'haréis', 'harán',
+            'haría', 'harías', 'haríamos', 'haríais', 'harían',
+            'hecho', 'haciendo',
+            # PODER
+            'puedo', 'puedes', 'puede', 'podemos', 'podéis', 'pueden',
+            'pude', 'pudiste', 'pudo', 'pudimos', 'pudisteis', 'pudieron',
+            'podía', 'podías', 'podíamos', 'podíais', 'podían',
+            'podré', 'podrás', 'podrá', 'podremos', 'podréis', 'podrán',
+            'podría', 'podrías', 'podríamos', 'podríais', 'podrían',
+            'podido', 'pudiendo',
+            # DECIR
+            'digo', 'dices', 'dice', 'decimos', 'decís', 'dicen',
+            'dije', 'dijiste', 'dijo', 'dijimos', 'dijisteis', 'dijeron',
+            'decía', 'decías', 'decíamos', 'decíais', 'decían',
+            'diré', 'dirás', 'dirá', 'diremos', 'diréis', 'dirán',
+            'diría', 'dirías', 'diríamos', 'diríais', 'dirían',
+            'dicho', 'diciendo',
+            # IR
+            'voy', 'vas', 'va', 'vamos', 'vais', 'van',
+            'fui', 'fuiste', 'fue', 'fuimos', 'fuisteis', 'fueron',
+            'iba', 'ibas', 'íbamos', 'ibais', 'iban',
+            'iré', 'irás', 'irá', 'iremos', 'iréis', 'irán',
+            'iría', 'irías', 'iríamos', 'iríais', 'irían',
+            'ido', 'yendo',
+            # VER
+            'veo', 'ves', 've', 'vemos', 'veis', 'ven',
+            'vi', 'viste', 'vio', 'vimos', 'visteis', 'vieron',
+            'veía', 'veías', 'veíamos', 'veíais', 'veían',
+            'veré', 'verás', 'verá', 'veremos', 'veréis', 'verán',
+            'vería', 'verías', 'veríamos', 'veríais', 'verían',
+            'visto', 'viendo',
+            # DAR
+            'doy', 'das', 'da', 'damos', 'dais', 'dan',
+            'di', 'diste', 'dio', 'dimos', 'disteis', 'dieron',
+            'daba', 'dabas', 'dábamos', 'dabais', 'daban',
+            'daré', 'darás', 'dará', 'daremos', 'daréis', 'darán',
+            'daría', 'darías', 'daríamos', 'daríais', 'darían',
+            'dado', 'dando',
+            # SABER
+            'sé', 'sabes', 'sabe', 'sabemos', 'sabéis', 'saben',
+            'supe', 'supiste', 'supo', 'supimos', 'supisteis', 'supieron',
+            'sabía', 'sabías', 'sabíamos', 'sabíais', 'sabían',
+            'sabré', 'sabrás', 'sabrá', 'sabremos', 'sabréis', 'sabrán',
+            'sabría', 'sabrías', 'sabríamos', 'sabríais', 'sabrían',
+            'sabido', 'sabiendo',
+            # QUERER
+            'quiero', 'quieres', 'quiere', 'queremos', 'queréis', 'quieren',
+            'quise', 'quisiste', 'quiso', 'quisimos', 'quisisteis', 'quisieron',
+            'quería', 'querías', 'queríamos', 'queríais', 'querían',
+            'querré', 'querrás', 'querrá', 'querremos', 'querréis', 'querrán',
+            'querría', 'querrías', 'querríamos', 'querríais', 'querrían',
+            'querido', 'queriendo',
+            # LLEGAR
+            'llego', 'llegas', 'llega', 'llegamos', 'llegáis', 'llegan',
+            'llegué', 'llegaste', 'llegó', 'llegamos', 'llegasteis', 'llegaron',
+            'llegaba', 'llegabas', 'llegábamos', 'llegabais', 'llegaban',
+            'llegaré', 'llegarás', 'llegará', 'llegaremos', 'llegaréis', 'llegarán',
+            'llegaría', 'llegarías', 'llegaríamos', 'llegaríais', 'llegarían',
+            'llegado', 'llegando',
+            # PASAR (y qué pasó)
+            'paso', 'pasas', 'pasa', 'pasamos', 'pasáis', 'pasan',
+            'pasé', 'pasaste', 'pasó', 'pasamos', 'pasasteis', 'pasaron',
+            'pasaba', 'pasabas', 'pasábamos', 'pasabais', 'pasaban',
+            'pasaré', 'pasarás', 'pasará', 'pasaremos', 'pasaréis', 'pasarán',
+            'pasado', 'pasando',
+            # PONER
+            'pongo', 'pones', 'pone', 'ponemos', 'ponéis', 'ponen',
+            'puse', 'pusiste', 'puso', 'pusimos', 'pusisteis', 'pusieron',
+            'ponía', 'ponías', 'poníamos', 'poníais', 'ponían',
+            'pondré', 'pondrás', 'pondrá', 'pondremos', 'pondréis', 'pondrán',
+            'pondría', 'pondrías', 'pondríamos', 'pondríais', 'pondrían',
+            'puesto', 'poniendo',
+            # CREER
+            'creo', 'crees', 'cree', 'creemos', 'creéis', 'creen',
+            'creí', 'creíste', 'creyó', 'creímos', 'creísteis', 'creyeron',
+            'creía', 'creías', 'creíamos', 'creíais', 'creían',
+            'creeré', 'creerás', 'creerá', 'creeremos', 'creeréis', 'creerán',
+            'creído', 'creyendo',
+            # DEJAR
+            'dejo', 'dejas', 'deja', 'dejamos', 'dejáis', 'dejan',
+            'dejé', 'dejaste', 'dejó', 'dejamos', 'dejasteis', 'dejaron',
+            'dejaba', 'dejabas', 'dejábamos', 'dejabais', 'dejaban',
+            'dejaré', 'dejarás', 'dejará', 'dejaremos', 'dejaréis', 'dejarán',
+            'dejado', 'dejando',
+            # SEGUIR
+            'sigo', 'sigues', 'sigue', 'seguimos', 'seguís', 'siguen',
+            'seguí', 'seguiste', 'siguió', 'seguimos', 'seguisteis', 'siguieron',
+            'seguía', 'seguías', 'seguíamos', 'seguíais', 'seguían',
+            'seguiré', 'seguirás', 'seguirá', 'seguiremos', 'seguiréis', 'seguirán',
+            'seguido', 'siguiendo',
+            # ENCONTRAR
+            'encuentro', 'encuentras', 'encuentra', 'encontramos', 'encontráis', 'encuentran',
+            'encontré', 'encontraste', 'encontró', 'encontramos', 'encontrasteis', 'encontraron',
+            'encontraba', 'encontrabas', 'encontrábamos', 'encontrabais', 'encontraban',
+            'encontraré', 'encontrarás', 'encontrará', 'encontraremos', 'encontraréis', 'encontrarán',
+            'encontrado', 'encontrando',
+            # LLAMAR
+            'llamo', 'llamas', 'llama', 'llamamos', 'llamáis', 'llaman',
+            'llamé', 'llamaste', 'llamó', 'llamamos', 'llamasteis', 'llamaron',
+            'llamaba', 'llamabas', 'llamábamos', 'llamabais', 'llamaban',
+            'llamaré', 'llamarás', 'llamará', 'llamaremos', 'llamaréis', 'llamarán',
+            'llamado', 'llamando',
+            # VENIR
+            'vengo', 'vienes', 'viene', 'venimos', 'venís', 'vienen',
+            'vine', 'viniste', 'vino', 'vinimos', 'vinisteis', 'vinieron',
+            'venía', 'venías', 'veníamos', 'veníais', 'venían',
+            'vendré', 'vendrás', 'vendrá', 'vendremos', 'vendréis', 'vendrán',
+            'vendría', 'vendrías', 'vendríamos', 'vendríais', 'vendrían',
+            'venido', 'viniendo',
+            # PENSAR
+            'pienso', 'piensas', 'piensa', 'pensamos', 'pensáis', 'piensan',
+            'pensé', 'pensaste', 'pensó', 'pensamos', 'pensasteis', 'pensaron',
+            'pensaba', 'pensabas', 'pensábamos', 'pensabais', 'pensaban',
+            'pensaré', 'pensarás', 'pensará', 'pensaremos', 'pensaréis', 'pensarán',
+            'pensado', 'pensando',
+            # SALIR
+            'salgo', 'sales', 'sale', 'salimos', 'salís', 'salen',
+            'salí', 'saliste', 'salió', 'salimos', 'salisteis', 'salieron',
+            'salía', 'salías', 'salíamos', 'salíais', 'salían',
+            'saldré', 'saldrás', 'saldrá', 'saldremos', 'saldréis', 'saldrán',
+            'saldría', 'saldrías', 'saldríamos', 'saldríais', 'saldrían',
+            'salido', 'saliendo',
+            # SENTIR
+            'siento', 'sientes', 'siente', 'sentimos', 'sentís', 'sienten',
+            'sentí', 'sentiste', 'sintió', 'sentimos', 'sentisteis', 'sintieron',
+            'sentía', 'sentías', 'sentíamos', 'sentíais', 'sentían',
+            'sentiré', 'sentirás', 'sentirá', 'sentiremos', 'sentiréis', 'sentirán',
+            'sentido', 'sintiendo',
+            # PREGUNTAR
+            'pregunto', 'preguntas', 'pregunta', 'preguntamos', 'preguntáis', 'preguntan',
+            'pregunté', 'preguntaste', 'preguntó', 'preguntamos', 'preguntasteis', 'preguntaron',
+            'preguntaba', 'preguntabas', 'preguntábamos', 'preguntabais', 'preguntaban',
+            'preguntaré', 'preguntarás', 'preguntará', 'preguntaremos', 'preguntaréis', 'preguntarán',
+            'preguntado', 'preguntando',
+            # HABLAR
+            'hablo', 'hablas', 'habla', 'hablamos', 'habláis', 'hablan',
+            'hablé', 'hablaste', 'habló', 'hablamos', 'hablasteis', 'hablaron',
+            'hablaba', 'hablabas', 'hablábamos', 'hablabais', 'hablaban',
+            'hablaré', 'hablarás', 'hablará', 'hablaremos', 'hablaréis', 'hablarán',
+            'hablado', 'hablando',
+            # VIVIR
+            'vivo', 'vives', 'vive', 'vivimos', 'vivís', 'viven',
+            'viví', 'viviste', 'vivió', 'vivimos', 'vivisteis', 'vivieron',
+            'vivía', 'vivías', 'vivíamos', 'vivíais', 'vivían',
+            'viviré', 'vivirás', 'vivirá', 'viviremos', 'viviréis', 'vivirán',
+            'vivido', 'viviendo',
+            # TOMAR
+            'tomo', 'tomas', 'toma', 'tomamos', 'tomáis', 'toman',
+            'tomé', 'tomaste', 'tomó', 'tomamos', 'tomasteis', 'tomaron',
+            'tomaba', 'tomabas', 'tomábamos', 'tomabais', 'tomaban',
+            'tomaré', 'tomarás', 'tomará', 'tomaremos', 'tomaréis', 'tomarán',
+            'tomado', 'tomando',
+            # OTROS COMUNES
+            'aquí', 'allí', 'ahí', 'allá', 'acá',
+            'quizás', 'tal vez', 'además', 'través', 'después', 'atrás', 'aún',
+            'mío', 'mía', 'míos', 'mías', 'tuyo', 'tuya', 'tuyos', 'tuyas', 'suyo', 'suya', 'suyos', 'suyas',
+            'enseguida', 'ahora', 'antes', 'entonces', 'luego', 'tarde', 'temprano', 'pronto',
+            'mimi', 'stella', 'prunu', 'vainilla', 'vaynilla',
+            # De la lista de tildes
+            'próxima', 'dónde', 'está', 'lección', 'comenzó', 'perdí', 'montón', 'recién',
+            'iba', 'había', 'podía', 'decía'
+        }
+
+        # Inicializar corrector si está disponible
+        if SPELLCHECK_AVAILABLE:
+            try:
+                local_dict_path = None
+                
+                # 1. Intentar cargar desde recursos embebidos (PyInstaller --add-data)
+                if hasattr(sys, '_MEIPASS'):
+                    embedded_path = Path(sys._MEIPASS) / "es.json.gz"
+                    if embedded_path.exists():
+                        local_dict_path = embedded_path
+
+                # 2. Si no, intentar archivo local junto al ejecutable/script
+                if not local_dict_path:
+                    side_path = base_dir / "es.json.gz"
+                    if side_path.exists():
+                        local_dict_path = side_path
+
+                if local_dict_path:
+                    self.spell_checker = SpellChecker(language=None, local_dictionary=str(local_dict_path))
+                else:
+                    # Fallback a descarga/default (requiere internet 1ra vez)
+                    self.spell_checker = SpellChecker(language='es')
+
+                # Cargar palabras comunes faltantes
+                self.spell_checker.word_frequency.load_words(self.COMMON_MISSING)
+                # Cargar diccionario personalizado
+                self._load_custom_dictionary()
+            except Exception as e:
+                print(f"[WARNING] No se pudo inicializar SpellChecker: {e}")
+                self.spell_checker = None
     
+    def _load_custom_dictionary(self):
+        """Carga palabras del archivo JSON personalizado"""
+        if not self.dict_path.exists():
+            return
+        try:
+            with open(self.dict_path, 'r', encoding='utf-8') as f:
+                custom_words = json.load(f)
+                if isinstance(custom_words, list):
+                    self.spell_checker.word_frequency.load_words(custom_words)
+        except Exception as e:
+            print(f"[ERROR] Error cargando diccionario personalizado: {e}")
+
+    def add_to_dictionary(self, word: str):
+        """Añade una palabra al diccionario y guarda en disco"""
+        if not self.spell_checker:
+            return
+        
+        # Añadir a la instancia actual
+        self.spell_checker.word_frequency.load_words([word])
+        
+        # Guardar en disco
+        try:
+            current_words = []
+            if self.dict_path.exists():
+                with open(self.dict_path, 'r', encoding='utf-8') as f:
+                    current_words = json.load(f)
+            
+            if word not in current_words:
+                current_words.append(word)
+                with open(self.dict_path, 'w', encoding='utf-8') as f:
+                    json.dump(current_words, f, ensure_ascii=False, indent=2)
+            
+            # Re-verificar el texto para limpiar el error visual
+            self._on_text_changed()
+            
+        except Exception as e:
+            print(f"[ERROR] Error guardando palabra en diccionario: {e}")
+            QMessageBox.warning(self, "Error", f"No se pudo guardar la palabra: {e}")
+
     def _on_text_changed_debounced(self):
         """Aplica debounce para no verificar cada letra (optimización)"""
-        # Cancelar timer anterior si existe
         if self.debounce_timer:
             self.debounce_timer.stop()
         
-        # Crear nuevo timer con 500ms de retraso
         self.debounce_timer = QTimer()
         self.debounce_timer.setSingleShot(True)
         self.debounce_timer.timeout.connect(self._on_text_changed)
-        self.debounce_timer.start(500)  # 500ms de espera
+        self.debounce_timer.start(500)
     
     def _on_text_changed(self):
         """Inicia verificación en hilo separado (no bloquea la UI)"""
@@ -2069,9 +2390,9 @@ class SpellCheckTextEdit(QTextEdit):
         # Iniciar verificación en hilo separado
         self.check_thread = threading.Thread(target=self._check_spelling_thread, args=(text,), daemon=True)
         self.check_thread.start()
-    
+
     def _check_spelling_thread(self, text: str):
-        """Verifica ortografía en hilo separado (no bloquea la UI)"""
+        """Verifica ortografía en hilo separado (no bloquea la UI) usando pyspellchecker y reglas personalizadas para tildes"""
         try:
             if not text.strip():
                 self.errors = []
@@ -2081,24 +2402,66 @@ class SpellCheckTextEdit(QTextEdit):
                 if self.pending_check:
                     self._on_text_changed()
                 return
-            
-            # Obtener todos los errores del texto (ESTO ES LO QUE TOMA TIEMPO)
-            errors = self.spell_checker.check(text)
+
+            # Palabras frecuentes que requieren tilde y su forma correcta
+            tildes = {
+                'proxima': 'próxima',
+                'donde': 'dónde',
+                'esta': 'está',
+                'leccion': 'lección',
+                'comenzo': 'comenzó',
+                'perdi': 'perdí',
+                'monton': 'montón',
+                'recien': 'recién',
+                'hiba': 'iba',
+                'habia': 'había',
+                'podia': 'podía',
+                'decia': 'decía',
+                'mimi': 'Mimi',
+                'stella': 'Stella',
+                'prunu': 'Prunu',
+            }
+
+            words = re.findall(r'\w+', text, re.UNICODE)
+            unknown = self.spell_checker.unknown(words)
+            misspelled = set(unknown) if unknown else set()
+            # Añadir palabras sin tilde a los errores
+            for w in words:
+                if w.lower() in tildes and w != tildes[w.lower()]:
+                    misspelled.add(w)
+
             error_positions = {}
-            
-            # Mapear posiciones de errores
-            for error in errors:
-                start = error.offset
-                end = error.offset + error.errorLength
-                error_positions[start] = (end, error)
-            
-            # Guardar resultados
+            errors = []
+
+            for match in re.finditer(r'\w+', text, re.UNICODE):
+                word = match.group(0)
+                if word in misspelled:
+                    start = match.start()
+                    end = match.end()
+                    # Simular objeto error para compatibilidad
+                    class Error:
+                        def __init__(self, word, offset, errorLength, replacements):
+                            self.word = word
+                            self.offset = offset
+                            self.errorLength = errorLength
+                            self.replacements = replacements
+                    # Sugerencias: primero la forma con tilde si aplica
+                    suggestions = []
+                    if word.lower() in tildes:
+                        suggestions.append(tildes[word.lower()])
+                    cands = self.spell_checker.candidates(word)
+                    if cands:
+                        suggestions += [s for s in cands if s not in suggestions]
+                    error = Error(word, start, end-start, suggestions)
+                    error_positions[start] = (end, error)
+                    errors.append(error)
+
             self.errors = errors
             self.error_positions = error_positions
-            
-            # Actualizar highlights en el hilo principal
+
             QTimer.singleShot(0, self._highlight_misspelled)
-            
+            QTimer.singleShot(0, self._update_cursor_info)
+
         except Exception as e:
             print(f"[ERROR] Error al verificar ortografía: {e}")
             self.errors = []
@@ -2108,6 +2471,8 @@ class SpellCheckTextEdit(QTextEdit):
             self.checking = False
             if self.pending_check:
                 QTimer.singleShot(100, self._on_text_changed)
+    
+
     
     def _highlight_misspelled(self):
         """Resalta las palabras mal escritas con subrayado rojo"""
@@ -2258,6 +2623,11 @@ class SpellCheckDialog(QDialog):
         self.ignore_btn = QPushButton("Ignorar")
         self.ignore_btn.clicked.connect(self._ignore_word)
         controls.addWidget(self.ignore_btn)
+
+        self.add_dict_btn = QPushButton("Agregar a Dicc.")
+        self.add_dict_btn.setToolTip("Guardar palabra en diccionario personalizado")
+        self.add_dict_btn.clicked.connect(self._add_to_dict)
+        controls.addWidget(self.add_dict_btn)
         
         layout.addLayout(controls)
         
@@ -2325,7 +2695,8 @@ class SpellCheckDialog(QDialog):
         if self.suggestion_list.currentRow() < 0:
             return
         
-        item = self.suggestion_list.item(self.suggestion_list.currentRow())
+        row = self.suggestion_list.currentRow()
+        item = self.suggestion_list.item(row)
         word = item.data(Qt.ItemDataRole.UserRole)
         suggestion = self.suggestion_combo.currentText()
         
@@ -2336,13 +2707,32 @@ class SpellCheckDialog(QDialog):
         # Obtener información del error
         start_pos, end_pos, error = item.data(Qt.ItemDataRole.UserRole + 2)
         
+        # Calcular diferencia de longitud
+        original_len = end_pos - start_pos
+        new_len = len(suggestion)
+        delta = new_len - original_len
+        
         # Aplicar reemplazo directo en la posición
         self.text_edit.apply_replacement(start_pos, end_pos, suggestion)
         
         self.corrections_applied[word] = suggestion
         
+        # Actualizar posiciones de TODOS los ítems siguientes en la lista
+        # ya que el texto se ha desplazado
+        for i in range(self.suggestion_list.count()):
+            if i == row: continue
+            
+            other_item = self.suggestion_list.item(i)
+            o_start, o_end, o_error = other_item.data(Qt.ItemDataRole.UserRole + 2)
+            
+            # Si el otro error está después de este, desplazarlo
+            if o_start > start_pos:
+                o_start += delta
+                o_end += delta
+                other_item.setData(Qt.ItemDataRole.UserRole + 2, (o_start, o_end, o_error))
+        
         # Remover de la lista y actualizar
-        self.suggestion_list.takeItem(self.suggestion_list.currentRow())
+        self.suggestion_list.takeItem(row)
         
         if self.suggestion_list.count() == 0:
             QMessageBox.information(self, "Corrección Ortográfica", "¡Todas las palabras han sido revisadas!")
@@ -2361,19 +2751,19 @@ class SpellCheckDialog(QDialog):
             QMessageBox.warning(self, "Error", "Selecciona una sugerencia primero")
             return
         
-        # Reemplazar todas las ocurrencias
+        # Reemplazar todas las ocurrencias en el texto
+        # Nota: Esto invalida todos los índices actuales, por lo que cerramos el diálogo
+        # para forzar un re-escaneo.
         text = self.text_edit.toPlainText()
         new_text = text.replace(word, suggestion)
         self.text_edit.setPlainText(new_text)
         
         self.corrections_applied[word] = suggestion
         
-        # Remover de la lista
-        self.suggestion_list.takeItem(self.suggestion_list.currentRow())
-        
-        if self.suggestion_list.count() == 0:
-            QMessageBox.information(self, "Corrección Ortográfica", "¡Todas las palabras han sido revisadas!")
-            self.accept()
+        QMessageBox.information(self, "Reemplazar Todo", 
+            f"Se han reemplazado todas las ocurrencias de '{word}' por '{suggestion}'.\n\n"
+            "El diálogo se cerrará para recalcular los errores restantes.")
+        self.accept()
     
     def _ignore_word(self):
         """Ignora la palabra actual sin corregir"""
@@ -2383,6 +2773,26 @@ class SpellCheckDialog(QDialog):
             if self.suggestion_list.count() == 0:
                 QMessageBox.information(self, "Corrección Ortográfica", "¡Todas las palabras han sido revisadas!")
                 self.accept()
+
+    def _add_to_dict(self):
+        """Añade la palabra actual al diccionario personalizado"""
+        if self.suggestion_list.currentRow() < 0:
+            return
+
+        item = self.suggestion_list.item(self.suggestion_list.currentRow())
+        word = item.data(Qt.ItemDataRole.UserRole)
+        
+        # Llamar al método del editor
+        self.text_edit.add_to_dictionary(word)
+        
+        # Remover de la lista ya que ahora es correcta
+        self.suggestion_list.takeItem(self.suggestion_list.currentRow())
+        
+        QMessageBox.information(self, "Diccionario", f"Palabra '{word}' añadida al diccionario.")
+        
+        if self.suggestion_list.count() == 0:
+            QMessageBox.information(self, "Corrección Ortográfica", "¡Todas las palabras han sido revisadas!")
+            self.accept()
 
 # ---------------- Ventana principal ----------------
 class MangaTextTool(QMainWindow):
@@ -2485,6 +2895,14 @@ class MangaTextTool(QMainWindow):
             if isinstance(it, StrokeTextItem): self._apply_movable_state(it)
         ctx.scene.update()
     
+    def toggle_text_numbers(self):
+        StrokeTextItem.SHOW_ORDINAL = self.show_nums_act.isChecked()
+        # Force update all scenes
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, PageContext) and w.scene:
+                w.scene.update()
+    
     def mark_tab_modified(self, ctx: Optional[PageContext] = None):
         """Marca una pestaña como modificada (con cambios sin guardar)."""
         if ctx is None:
@@ -2500,6 +2918,51 @@ class MangaTextTool(QMainWindow):
             current_name = self.tabs.tabText(idx)
             if not current_name.startswith('*'):
                 self.tabs.setTabText(idx, f"*{current_name}")
+
+    def check_for_updates(self, show_up_to_date: bool = True):
+        """Consulta un version.json remoto y ofrece descargar si hay una version nueva."""
+        if not UPDATE_JSON_URL or "TU_USUARIO" in UPDATE_JSON_URL:
+            if show_up_to_date:
+                QMessageBox.information(
+                    self,
+                    "Actualizaciones",
+                    "Configura UPDATE_JSON_URL con la URL real de tu version.json."
+                )
+            return
+
+        try:
+            req = urllib.request.Request(
+                UPDATE_JSON_URL,
+                headers={"User-Agent": "AnimeBBG-Editor"}
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = resp.read().decode("utf-8", errors="replace")
+            payload = json.loads(data)
+            remote_version = str(payload.get("version", "")).strip()
+            download_url = str(payload.get("url", "")).strip()
+            notes = str(payload.get("notes", "")).strip()
+
+            if not remote_version or not download_url:
+                raise ValueError("version.json incompleto (version/url).")
+
+            if _is_newer_version(remote_version, APP_VERSION):
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Actualizacion disponible")
+                msg.setText(f"Hay una nueva version: {remote_version}")
+                if notes:
+                    msg.setInformativeText(notes)
+                msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                msg.button(QMessageBox.StandardButton.Yes).setText("Descargar")
+                msg.button(QMessageBox.StandardButton.No).setText("Luego")
+                if msg.exec() == QMessageBox.StandardButton.Yes:
+                    webbrowser.open(download_url)
+            else:
+                if show_up_to_date:
+                    QMessageBox.information(self, "Actualizaciones", "Ya tienes la ultima version.")
+
+        except Exception as e:
+            if show_up_to_date:
+                QMessageBox.warning(self, "Actualizaciones", f"No se pudo buscar actualizaciones:\n{e}")
 
     def closeEvent(self, event):
         # Verificar si hay pestañas con cambios sin guardar
@@ -2655,6 +3118,13 @@ class MangaTextTool(QMainWindow):
         self.lock_move_act = self.add_act(tb, 'lock.png', "Bloqueo global de movimiento • M",
                                           lambda: self.set_movement_locked(self.lock_move_act.isChecked()),
                                           "M", checkable=True)
+        
+        # Toggle Text Numbers
+        self.show_nums_act = self.add_act(tb, '', "Mostrar/Ocultar numeración • N",
+                                          self.toggle_text_numbers, "N", checkable=True)
+        self.show_nums_act.setText("123")  # Fallback text since no icon
+        self.show_nums_act.setChecked(StrokeTextItem.SHOW_ORDINAL)
+        
         lock_sel    = self.add_act(tb, 'pin.png', "Fijar seleccionados • Ctrl+L", self.lock_selected_items, "Ctrl+L")
         lock_all    = self.add_act(tb, 'pin-all.png', "Fijar TODOS en pestaña • Ctrl+Shift+L", self.lock_all_items_current_tab, "Ctrl+Shift+L")
         unlock_sel  = self.add_act(tb, 'unlock.png', "Desbloquear seleccionados • Ctrl+U", self.unlock_selected_items_confirm, "Ctrl+U")
@@ -2663,6 +3133,9 @@ class MangaTextTool(QMainWindow):
             "Workflow Automático (Ctrl+W) → automatiza RAW → Traducción → Imágenes Limpias → Colocación de textos.\n"
             "Ctrl+esquina: escala; círculo superior: rotar.\n"
             "Fijar seleccionados: bloquea movimiento, rotación y resize (sigue seleccionable)."))
+
+        # Actualizaciones
+        update_act = self.add_act(tb, 'upload.png', "Buscar actualizaciones", lambda: self.check_for_updates(True))
 
         # Alternar paneles
         self.toggle_props_act = QAction(icon('panel.png'), "", self, checkable=True)
@@ -2885,7 +3358,15 @@ class MangaTextTool(QMainWindow):
         self.out_btn = QPushButton("Color trazo…"); self.out_btn.clicked.connect(lambda: self.choose_color('outline')); layout.addRow("Trazo", self.out_btn)
         
         self.no_stroke_chk = QCheckBox("Sin trazo"); self.no_stroke_chk.stateChanged.connect(self.on_no_stroke_toggle); layout.addRow(self.no_stroke_chk)
-        self.outw_slider = QSlider(Qt.Orientation.Horizontal); self.outw_slider.setRange(0, 40); self.outw_slider.setValue(3); self.outw_slider.valueChanged.connect(self.on_outline_width); layout.addRow("Grosor trazo", self.outw_slider)
+        self.outw_slider = QSlider(Qt.Orientation.Horizontal)
+        self.outw_slider.setRange(0, 40)
+        self.outw_slider.setValue(3)
+        self.outw_slider.valueChanged.connect(self.on_outline_width)
+        self.outw_label = QLabel(str(self.outw_slider.value()))
+        outw_layout = QHBoxLayout()
+        outw_layout.addWidget(self.outw_slider)
+        outw_layout.addWidget(self.outw_label)
+        layout.addRow("Grosor trazo", outw_layout)
         self.shadow_chk = QCheckBox("Sombra"); self.shadow_chk.stateChanged.connect(self.on_shadow_toggle); layout.addRow(self.shadow_chk)
 
         self.bg_chk = QCheckBox("Fondo caja"); self.bg_chk.stateChanged.connect(self.on_bg_toggle); layout.addRow(self.bg_chk)
@@ -2894,11 +3375,18 @@ class MangaTextTool(QMainWindow):
 
         self.align_combo = QComboBox(); self.align_combo.addItems(["Izquierda", "Centro", "Derecha", "Justificar"]); self.align_combo.setCurrentIndex(1); self.align_combo.currentIndexChanged.connect(self.on_alignment_changed); layout.addRow("Alineación", self.align_combo)
 
-        # Interlineado con slider
-        self.linespace_slider = QSlider(Qt.Orientation.Horizontal); self.linespace_slider.setRange(80, 300); self.linespace_slider.setValue(120); self.linespace_slider.valueChanged.connect(lambda v: self.on_linespacing_changed(v/100)); layout.addRow("Interlineado", self.linespace_slider)
+        # Interlineado con slider y label
+        self.linespace_slider = QSlider(Qt.Orientation.Horizontal)
+        self.linespace_slider.setRange(80, 300)
+        self.linespace_slider.setValue(120)
+        self.linespace_slider.valueChanged.connect(lambda v: self.on_linespacing_changed(v/100))
+        self.linespace_label = QLabel(f"{self.linespace_slider.value()/100:.2f}")
+        linespace_layout = QHBoxLayout()
+        linespace_layout.addWidget(self.linespace_slider)
+        linespace_layout.addWidget(self.linespace_label)
+        layout.addRow("Interlineado", linespace_layout)
 
-        # Rotación
-        self.rotate_slider = QSlider(Qt.Orientation.Horizontal); self.rotate_slider.setRange(-180, 180); self.rotate_slider.setValue(0); self.rotate_slider.valueChanged.connect(lambda v: self.on_rotation_changed(float(v))); layout.addRow("Rotación", self.rotate_slider)
+
 
         # Capitalización
         self.cap_combo = QComboBox(); self.cap_combo.addItems(["Normal", "MAYÚSCULAS", "minúsculas"]); self.cap_combo.currentIndexChanged.connect(self.on_capitalization_changed); layout.addRow("Mayús/minús", self.cap_combo)
@@ -3021,12 +3509,23 @@ class MangaTextTool(QMainWindow):
         for line in lines:
             preset_key, clean = parse_identifier(line)
             parts = [p.strip() for p in clean.split('//') if p.strip()] or [clean.strip()]
+            first_style = None
             for idx, seg in enumerate(parts):
-                if not seg: continue
-                use_preset = preset_key if idx == 0 else 'ANIDADO'
-                style = PRESETS.get(use_preset, PRESETS['GLOBO'])
-                item = StrokeTextItem(seg, replace(style), name=use_preset)
-                item.setFont(item.style.to_qfont()); self._push_add_command(ctx, item, QPointF(50, y)); y += 70
+                if not seg:
+                    continue
+                if idx == 0:
+                    use_preset = preset_key
+                    style = replace(PRESETS.get(use_preset, PRESETS['GLOBO']))
+                    # Guardar el estilo del primer globo
+                    first_style = replace(style)
+                else:
+                    use_preset = preset_key  # Mantener el mismo nombre
+                    # Usar una copia del estilo del primer globo
+                    style = replace(first_style) if first_style else replace(PRESETS['ANIDADO'])
+                item = StrokeTextItem(seg, style, name=use_preset)
+                item.setFont(item.style.to_qfont())
+                self._push_add_command(ctx, item, QPointF(50, y))
+                y += 70
     
     def _open_spellcheck_dialog(self, text_edit: SpellCheckTextEdit):
         """Abre el diálogo de corrección ortográfica"""
@@ -3036,6 +3535,17 @@ class MangaTextTool(QMainWindow):
                 "Función no disponible",
                 "El corrector ortográfico no está disponible.\n"
                 "Instala: pip install pyspellchecker"
+            )
+            return
+
+        if not text_edit.spell_checker:
+            QMessageBox.warning(
+                self,
+                "Error de inicialización",
+                "No se pudo cargar el diccionario de español.\n\n"
+                "Posibles causas:\n"
+                "1. Falta conexión a internet (para descargar el diccionario por primera vez).\n"
+                "2. El archivo de diccionario no está incluido en el ejecutable."
             )
             return
         
@@ -3154,21 +3664,40 @@ class MangaTextTool(QMainWindow):
     # ---------------- Propiedades ----------------
     def _sync_props_from_item(self, item: StrokeTextItem):
         bs = [self.width_spin, self.outw_slider, self.align_combo, self.linespace_slider,
-              self.rotate_slider, self.symb_combo, self.no_stroke_chk,
+              self.symb_combo, self.no_stroke_chk,
               self.shadow_chk, self.bg_chk, self.bg_op, self.cap_combo, self.bold_chk]
         for w in bs: w.blockSignals(True)
 
         # NUEVO: Mostrar advertencia si la fuente original no está disponible (tipo Photoshop)
-        if (hasattr(item, 'original_font_family') and 
-            item.original_font_family != item.style.font_family and 
-            not item.font_missing_warning_shown):
-            QMessageBox.warning(
-                self, "Fuente faltante", 
-                f"La fuente '{item.original_font_family}' no está instalada en tu sistema.\n\n"
+        suppress_warning = self.settings.value("suppress_font_warning", False, type=bool)
+        
+        should_warn = (hasattr(item, 'original_font_family') and 
+                       item.original_font_family != item.style.font_family and 
+                       not is_font_installed(item.original_font_family) and
+                       not item.font_missing_warning_shown and
+                       not suppress_warning)
+
+        if should_warn:
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setWindowTitle("Fuente faltante")
+            msg_box.setText(f"La fuente '{item.original_font_family}' no está instalada en tu sistema.")
+            msg_box.setInformativeText(
                 f"Se está usando '{item.style.font_family}' como fallback.\n\n"
                 f"Si editas este texto, se guardará con la fuente fallback. "
                 f"Para restaurar la fuente original, instálala en tu sistema e reabre el proyecto."
             )
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            
+            # Checkbox to suppress future warnings
+            cb = QCheckBox("No volver a mostrar este mensaje")
+            msg_box.setCheckBox(cb)
+            
+            msg_box.exec()
+            
+            if cb.isChecked():
+                self.settings.setValue("suppress_font_warning", True)
+
             item.font_missing_warning_shown = True
 
         self.width_spin.setValue(int(item.textWidth()))
@@ -3190,9 +3719,7 @@ class MangaTextTool(QMainWindow):
         self.linespace_slider.setValue(linespace_value)
         self.linespace_label.setText(f"{linespace_value/100:.2f}")
         
-        rotate_value = int(float(item.rotation()))
-        self.rotate_slider.setValue(rotate_value)
-        self.rotate_label.setText(f"{rotate_value}°")
+
         self.shadow_chk.setChecked(bool(item.style.shadow_enabled))
         self.bg_chk.setChecked(bool(item.style.background_enabled))
         try: self.bg_op.setValue(int(clamp(item.style.background_opacity, 0, 1)*100))
@@ -4143,186 +4670,502 @@ class FontsPerPresetDialog(QDialog):
         return self.apply_chk.isChecked()
 
 
+class GradientEditBar(QWidget):
+    """
+    Widget tipo 'Photoshop' para editar el degradado.
+    - Muestra barra con preview.
+    - Handles abajo para mover stops.
+    - Click en área vacía = nuevo stop.
+    - Drag handles = mover.
+    - Click handle = seleccionar (emitir signal).
+    - Drag afuera / Supr = borrar.
+    """
+    # Emite (posición, color_hex) cuando se selecciona un stop
+    stopSelected = pyqtSignal(float, str)
+    # Emite la lista completa de stops [(pos, hex), ...] cada vez que cambia algo
+    gradientChanged = pyqtSignal(list)
+
+    HANDLE_SIZE = 10  # Tamaño del triangulito/cuadrado del handle
+
+    def __init__(self, stops: List[Tuple[float, str]] = None, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(50)
+        self.setMouseTracking(True)
+        # Stops es lista de (pos, hex)
+        # Asegurar orden
+        self.stops = sorted(stops if stops else [(0.0, "#000000"), (1.0, "#FFFFFF")], key=lambda x: x[0])
+        self.selected_index = -1
+        self._dragging_index = -1
+        self._hover_index = -1
+
+    def set_stops(self, stops: List[Tuple[float, str]]):
+        self.stops = sorted(stops, key=lambda x: x[0])
+        self.update()
+
+    def get_stops(self) -> List[Tuple[float, str]]:
+        return self.stops
+
+    def set_selected_stop_color(self, color_hex: str):
+        if 0 <= self.selected_index < len(self.stops):
+            pos, _ = self.stops[self.selected_index]
+            self.stops[self.selected_index] = (pos, color_hex)
+            self.update()
+            self.gradientChanged.emit(self.stops)
+
+    def set_selected_stop_pos(self, pos: float):
+        if 0 <= self.selected_index < len(self.stops):
+            _, col = self.stops[self.selected_index]
+            pos = max(0.0, min(1.0, pos))
+            self.stops[self.selected_index] = (pos, col)
+            # Reordenar y mantener selección
+            # (Un poco tricky mantener el índice correcto al reordenar pero para UX simple basta)
+            self.stops.sort(key=lambda x: x[0])
+            # Buscar dónde quedó
+            for i, (p, c) in enumerate(self.stops):
+                if p == pos and c == col:
+                    self.selected_index = i
+                    break
+            self.update()
+            self.gradientChanged.emit(self.stops)
+
+    def delete_selected_stop(self):
+        if 0 <= self.selected_index < len(self.stops):
+            if len(self.stops) <= 2:
+                # Opcional: impedir borrar si hay menos de 2
+                return
+            self.stops.pop(self.selected_index)
+            self.selected_index = -1
+            self.update()
+            self.gradientChanged.emit(self.stops)
+            # Emitir -1 para indicar des-selección
+            self.stopSelected.emit(-1.0, "")
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w = self.width()
+        h_bar = self.height() - self.HANDLE_SIZE - 5 # Altura de la barra de color
+        bar_rect = QRectF(0, 0, w, h_bar)
+
+        # 1. Fondo checkerboard para alpha
+        step = 10
+        p.setPen(Qt.PenStyle.NoPen)
+        for y in range(0, int(h_bar), step):
+            for x in range(0, w, step):
+                if ((x//step) + (y//step)) % 2 == 0:
+                    p.setBrush(QColor("#CCCCCC"))
+                else:
+                    p.setBrush(QColor("#FFFFFF"))
+                p.drawRect(x, y, step, step)
+
+        # 2. Gradiente
+        grad = QLinearGradient(0, 0, w, 0)
+        for pos, col in self.stops:
+            grad.setColorAt(pos, QColor(col))
+        p.setBrush(QBrush(grad))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRect(bar_rect)
+        p.setPen(QPen(QColor("#888888"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(bar_rect)
+
+        # 3. Handles
+        for i, (pos, col) in enumerate(self.stops):
+            x = int(pos * w)
+            y_start = h_bar + 2
+            
+            # Dibujar triangulito + cuadrado
+            # Forma simple: Rect con borde
+            h_rect = self._handle_rect(x, y_start)
+            
+            p.setBrush(QColor(col))
+            if i == self.selected_index:
+                p.setPen(QPen(QColor("#00AAFF"), 2)) # Azul si seleccionado
+            elif i == self._hover_index:
+                p.setPen(QPen(QColor("#FFFFFF"), 2)) # Blanco si hover
+            else:
+                p.setPen(QPen(QColor("#000000"), 1))
+            
+            p.drawRect(h_rect)
+
+        p.end()
+
+    def _handle_rect(self, x_center, y_top):
+        s = self.HANDLE_SIZE
+        return QRectF(x_center - s/2, y_top, s, s)
+
+    def mousePressEvent(self, event):
+        pos = event.pos()
+        x, y = pos.x(), pos.y()
+        w = self.width()
+        
+        # Verificar clicks en handles existentes
+        clicked_index = -1
+        h_bar = self.height() - self.HANDLE_SIZE - 5
+        
+        # Revisar en orden inverso (arriba los últimos)
+        for i in range(len(self.stops)-1, -1, -1):
+            stop_pos, _ = self.stops[i]
+            rect = self._handle_rect(stop_pos * w, h_bar + 2)
+            # Expandir hit area un poco
+            hit_rect = rect.adjusted(-3, -3, 3, 3)
+            if hit_rect.contains(QPointF(x, y)):
+                clicked_index = i
+                break
+        
+        if clicked_index != -1:
+            self.selected_index = clicked_index
+            self._dragging_index = clicked_index
+            self.update()
+            s_pos, s_col = self.stops[self.selected_index]
+            self.stopSelected.emit(s_pos, s_col)
+            return
+
+        # Si click en la barra de gradiente vacía -> crear nuevo stop
+        if y < h_bar:
+            new_pos = max(0.0, min(1.0, x / w))
+            # Calcular color en ese punto interpolando
+            # Truco: usar un gradiente temporal de 1px
+            grad = QLinearGradient(0, 0, 100, 0)
+            for p, c in self.stops:
+                grad.setColorAt(p, QColor(c))
+            # Muestrear no es trivial sin QImage, así que hacemos estimación simple o usamos el último seleccionado
+            # Mejor: añadir blanco o negro por defecto, el usuario lo cambiará.
+            # O mejor aún: interpolar matemáticamente.
+            # Para simplicidad visual, usaremos el mismo color que el stop anterior o blanco.
+            new_col = "#FFFFFF" 
+            
+            self.stops.append((new_pos, new_col))
+            self.stops.sort(key=lambda x: x[0])
+            # Seleccionar el nuevo
+            for i, (p, c) in enumerate(self.stops):
+                if p == new_pos and c == new_col:
+                    self.selected_index = i
+                    self._dragging_index = i
+                    break
+            self.update()
+            self.gradientChanged.emit(self.stops)
+            s_pos, s_col = self.stops[self.selected_index]
+            self.stopSelected.emit(s_pos, s_col)
+
+    def mouseMoveEvent(self, event):
+        x = event.pos().x()
+        w = self.width()
+
+        if self._dragging_index != -1:
+            # Mover stop
+            # Si arrastra muy abajo -> borrar? Photoshop lo hace.
+            # Implementemos mover simple 0-1
+            new_pos = max(0.0, min(1.0, x / w))
+            _, col = self.stops[self._dragging_index]
+            self.stops[self._dragging_index] = (new_pos, col)
+            # Ordenar dinámicamente puede ser confuso mientras arrastras, pero necesario para el rendering correcto
+            self.stops.sort(key=lambda x: x[0])
+            # Re-encontrar índice
+            for i, (p, c) in enumerate(self.stops):
+                if p == new_pos and c == col:
+                    self._dragging_index = i
+                    self.selected_index = i
+                    break
+            
+            self.update()
+            self.gradientChanged.emit(self.stops)
+            self.stopSelected.emit(new_pos, col)
+        else:
+            # Hover check
+            h_bar = self.height() - self.HANDLE_SIZE - 5
+            hover_idx = -1
+            for i in range(len(self.stops)-1, -1, -1):
+                stop_pos, _ = self.stops[i]
+                rect = self._handle_rect(stop_pos * w, h_bar + 2)
+                if rect.contains(QPointF(x, event.pos().y())):
+                    hover_idx = i
+                    break
+            if hover_idx != self._hover_index:
+                self._hover_index = hover_idx
+                self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._dragging_index = -1
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.delete_selected_stop()
+
+
 class FillChooserDialog(QDialog):
-    """Diálogo sencillo con tres pestañas: Sólido, Degradado (2 stops) y Textura.
-    Actualiza la caja de texto en vivo mientras cambias valores (preview en tiempo real).
+    """Diálogo avanzado de relleno con editor de gradiente estilo Photoshop.
     """
     def __init__(self, parent, style: TextStyle, on_update_callback=None):
         super().__init__(parent)
-        self.setWindowTitle("Seleccionar relleno")
-        self.resize(420, 320)
+        self.setWindowTitle("Editor de Estilo y Relleno")
+        self.resize(550, 480)
         self.style = style
-        self.on_update_callback = on_update_callback  # Función para notificar cambios
+        self.on_update_callback = on_update_callback
         
-        lay = QVBoxLayout(self)
-        tabs = QTabWidget()
-        lay.addWidget(tabs)
+        # 1. Main Layout
+        main_layout = QVBoxLayout(self)
+        
+        # 2. Tabs
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
 
-        # -- Solid
-        solid_w = QWidget(); solid_l = QVBoxLayout(solid_w)
-        solid_info = QLabel("💡 Haz clic en 'Elegir color…' para ver los cambios en tiempo real")
-        solid_info.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        solid_l.addWidget(solid_info)
+        # --- TAB 1: SÓLIDO ---
+        solid_w = QWidget(); sl = QVBoxLayout(solid_w)
+        sl_form = QFormLayout()
         self.solid_btn = QPushButton("Elegir color…")
-        solid_l.addWidget(self.solid_btn); self.solid_preview = QLabel(); solid_l.addWidget(self.solid_preview)
-        solid_l.addStretch()
-        tabs.addTab(solid_w, "Sólido")
+        self.solid_preview = QLabel(); self.solid_preview.setFixedSize(100, 30); self.solid_preview.setStyleSheet("border: 1px solid #555;")
+        sl_form.addRow("Color:", self.solid_btn)
+        sl_form.addRow("Vista:", self.solid_preview)
+        sl.addLayout(sl_form); sl.addStretch()
+        self.tabs.addTab(solid_w, "Color Sólido")
 
-        # -- Gradient
-        grad_w = QWidget(); gl = QFormLayout(grad_w)
-        grad_info = QLabel("💡 Haz clic en los botones de color para ver los cambios en tiempo real")
-        grad_info.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        gl.addRow(grad_info)
-        self.grad_c1 = QPushButton("Color 1…")
-        self.grad_c2 = QPushButton("Color 2…")
-        self.grad_angle = QSpinBox(); self.grad_angle.setRange(0, 359); self.grad_angle.setValue(getattr(style, 'gradient_angle', 0))
-        gl.addRow("Color inicio", self.grad_c1); gl.addRow("Color fin", self.grad_c2); gl.addRow("Ángulo", self.grad_angle)
-        self.grad_preview = QLabel(); gl.addRow(self.grad_preview)
-        tabs.addTab(grad_w, "Degradado")
+        # --- TAB 2: DEGRADADO (Advanced) ---
+        grad_w = QWidget()
+        gl = QVBoxLayout(grad_w)
+        
+        # Preset bar (Grid pequeño de botones)
+        # Por brevedad, pondremos unos pocos presets
+        presets_layout = QHBoxLayout()
+        presets_label = QLabel("Presets:")
+        presets_layout.addWidget(presets_label)
+        
+        self.preset_btns = []
+        # (Nombre, stops)
+        sample_grads = [
+            ("B/N", [(0.0, "#000000"), (1.0, "#FFFFFF")]),
+            ("Sunset", [(0.0, "#1A2980"), (1.0, "#26D0CE")]),
+            ("Fire", [(0.0, "#f12711"), (1.0, "#f5af19")]),
+            ("Rainbow", [(0.0,"#FF0000"),(0.2,"#FFFF00"),(0.4,"#00FF00"),(0.6,"#00FFFF"),(0.8,"#0000FF"),(1.0,"#FF00FF")]),
+        ]
+        
+        for name, stops in sample_grads:
+            btn = QPushButton()
+            btn.setFixedSize(24, 24)
+            btn.setToolTip(name)
+            # Set gradient background for button
+            qss_grad = "qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, "
+            qss_stops = ""
+            for p, c in stops: qss_stops += f"stop:{p} {c}, "
+            qss_grad += qss_stops[:-2] + ")"
+            btn.setStyleSheet(f"background: {qss_grad}; border:1px solid #777;")
+            btn.clicked.connect(lambda _, s=stops: self._load_gradient_stops(s))
+            presets_layout.addWidget(btn)
+        presets_layout.addStretch()
+        gl.addLayout(presets_layout)
 
-        # -- Texture
+        # Editor Bar
+        self.grad_bar = GradientEditBar(getattr(style, 'gradient_stops', None))
+        gl.addWidget(self.grad_bar)
+        
+        # Controls area
+        controls_group = QFrame(); controls_group.setStyleSheet("background: #222; border-radius: 4px; padding: 4px;")
+        cg_lay = QGridLayout(controls_group)
+        
+        cg_lay.addWidget(QLabel("Color:"), 0, 0)
+        self.stop_color_btn = QPushButton(" ")
+        self.stop_color_btn.setFixedSize(50, 24)
+        cg_lay.addWidget(self.stop_color_btn, 0, 1)
+        
+        cg_lay.addWidget(QLabel("Posición (%):"), 0, 2)
+        self.stop_pos_spin = QDoubleSpinBox()
+        self.stop_pos_spin.setRange(0, 100); self.stop_pos_spin.setSingleStep(1); self.stop_pos_spin.setSuffix("%")
+        cg_lay.addWidget(self.stop_pos_spin, 0, 3)
+        
+        self.stop_del_btn = QPushButton("Eliminar")
+        cg_lay.addWidget(self.stop_del_btn, 0, 4)
+        
+        gl.addWidget(controls_group)
+        
+        # Angle control
+        angle_lay = QHBoxLayout()
+        angle_lay.addWidget(QLabel("Ángulo Global:"))
+        self.angle_spin = QSpinBox(); self.angle_spin.setRange(-360, 360); self.angle_spin.setValue(int(getattr(style, 'gradient_angle', 0)))
+        self.angle_spin.setSuffix("°")
+        angle_lay.addWidget(self.angle_spin)
+        angle_lay.addStretch()
+        gl.addLayout(angle_lay)
+        
+        gl.addStretch()
+        self.tabs.addTab(grad_w, "Degradado")
+
+        # --- TAB 3: TEXTURA ---
         tex_w = QWidget(); tl = QVBoxLayout(tex_w)
         self.tex_pick = QPushButton("Elegir imagen…")
         self.tex_path_lbl = QLabel(getattr(style, 'texture_path', '') or "(ninguna)")
         self.tex_tile_chk = QCheckBox("Repetir (tile)"); self.tex_tile_chk.setChecked(getattr(style, 'texture_tile', True))
         tl.addWidget(self.tex_pick); tl.addWidget(self.tex_path_lbl); tl.addWidget(self.tex_tile_chk)
-        self.tex_preview = QLabel(); tl.addWidget(self.tex_preview)
+        self.tex_preview = QLabel(); self.tex_preview.setFixedSize(200, 100); self.tex_preview.setStyleSheet("border: 1px solid #555;")
+        tl.addWidget(self.tex_preview)
         tl.addStretch()
-        tabs.addTab(tex_w, "Textura")
+        self.tabs.addTab(tex_w, "Textura")
 
         # Buttons
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); main_layout.addWidget(bb)
 
-        # Conexiones: actualizar en tiempo real
+        # --- CONNECTIONS ---
+        # Solid
         self.solid_btn.clicked.connect(self._pick_solid)
-        self.grad_c1.clicked.connect(lambda: self._pick_grad_color(1))
-        self.grad_c2.clicked.connect(lambda: self._pick_grad_color(2))
-        self.grad_angle.valueChanged.connect(lambda: self._notify_update())
+        
+        # Gradient
+        self.grad_bar.stopSelected.connect(self._on_stop_selected_ui)
+        self.grad_bar.gradientChanged.connect(self._on_grad_changed_ui)
+        self.stop_color_btn.clicked.connect(self._pick_stop_color)
+        self.stop_pos_spin.valueChanged.connect(self._on_spin_pos_changed)
+        self.stop_del_btn.clicked.connect(self.grad_bar.delete_selected_stop)
+        self.angle_spin.valueChanged.connect(self._notify_update)
+        
+        # Texture
         self.tex_pick.clicked.connect(self._pick_texture)
-        self.tex_tile_chk.stateChanged.connect(lambda: self._notify_update())
+        self.tex_tile_chk.stateChanged.connect(self._notify_update)
+        
+        self.tabs.currentChanged.connect(self._notify_update)
 
-        # estado inicial
+        # Init state
         self._solid_color = getattr(style, 'fill', '#000000')
-        gs = getattr(style, 'gradient_stops', None) or [(0.0, getattr(style, 'fill', '#000000')), (1.0, getattr(style, 'fill', '#ffffff'))]
-        self._grad_stops = gs
-        self._grad_angle = int(getattr(style, 'gradient_angle', 0))
         self._tex_path = getattr(style, 'texture_path', '')
         self._tex_tile = bool(getattr(style, 'texture_tile', True))
-        self._update_previews()
+        
+        # Initial UI sync
+        self._update_solid_preview()
+        self._update_tex_preview()
+        
+        # Set initial tab
+        ft = getattr(style, 'fill_type', 'solid')
+        if ft == 'linear_gradient': self.tabs.setCurrentIndex(1)
+        elif ft == 'texture': self.tabs.setCurrentIndex(2)
+        else: self.tabs.setCurrentIndex(0)
 
+    # --- SOLID LOGIC ---
     def _pick_solid(self):
-        dlg = QColorDialog(qcolor_from_hex(self._solid_color), self)
+        c = qcolor_from_hex(self._solid_color)
+        dlg = QColorDialog(c, self)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
         dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
         
-        # Timer para actualizar en vivo mientras el diálogo está abierto
-        timer = QTimer()
-        def on_color_change():
-            cur = dlg.currentColor()
-            if cur.isValid():
-                self._solid_color = cur.name(QColor.NameFormat.HexRgb)
-                self._update_previews()
+        # Live preview
+        def on_change():
+            curr = dlg.currentColor()
+            if curr.isValid():
+                self._solid_color = curr.name(QColor.NameFormat.HexRgb)
+                self._update_solid_preview()
                 self._notify_update()
+                
+        dlg.currentColorChanged.connect(on_change)
+        # Some platforms/Qt versions don't emit currentColorChanged on every drag, timer helper
+        t = QTimer(dlg)
+        t.timeout.connect(on_change)
+        t.start(100)
         
-        dlg.currentColorChanged.connect(on_color_change)
-        timer.timeout.connect(on_color_change)
-        timer.start(50)
-        
-        result = dlg.exec()
-        timer.stop()
-        
-        if result == QColorDialog.DialogCode.Accepted:
-            self._solid_color = dlg.selectedColor().name(QColor.NameFormat.HexRgb)
-            self._update_previews()
-            self._notify_update()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            on_change() # Ensure final setting
+        else:
+            # Revert if cancelled? The previous implementation didn't strictly revert on cancel in the snapshot, 
+            # but usually users expect live preview to stick if they play with it, OR revert. 
+            # The 'choose_color' wrapper handles the snapshot revert if FillChooserDialog is cancelled.
+            pass
 
-    def _pick_grad_color(self, which: int):
-        cur = qcolor_from_hex(self._grad_stops[0][1] if which == 1 else self._grad_stops[1][1])
-        dlg = QColorDialog(cur, self)
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
-        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
-        
-        # Timer para actualizar en vivo
-        timer = QTimer()
-        def on_color_change():
-            c = dlg.currentColor()
-            if c.isValid():
-                col = c.name(QColor.NameFormat.HexRgb)
-                if which == 1:
-                    self._grad_stops[0] = (0.0, col)
-                else:
-                    self._grad_stops[1] = (1.0, col)
-                self._update_previews()
-                self._notify_update()
-        
-        dlg.currentColorChanged.connect(on_color_change)
-        timer.timeout.connect(on_color_change)
-        timer.start(50)
-        
-        result = dlg.exec()
-        timer.stop()
-        
-        if result == QColorDialog.DialogCode.Accepted:
-            col = dlg.selectedColor().name(QColor.NameFormat.HexRgb)
-            if which == 1:
-                self._grad_stops[0] = (0.0, col)
-            else:
-                self._grad_stops[1] = (1.0, col)
-            self._update_previews()
-            self._notify_update()
+    def _update_solid_preview(self):
+        self.solid_preview.setStyleSheet(f"background-color: {self._solid_color}; border: 1px solid #777;")
 
-    def _pick_texture(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Seleccionar textura", "", "Imágenes (*.png *.jpg *.jpeg *.webp)")
-        if not f: return
-        self._tex_path = f; self.tex_path_lbl.setText(f)
-        self._update_previews()
+    # --- GRADIENT LOGIC ---
+    def _load_gradient_stops(self, stops):
+        self.grad_bar.set_stops(stops)
         self._notify_update()
 
-    def _update_previews(self):
-        # Sólido preview
-        pm = QPixmap(120, 32); pm.fill(qcolor_from_hex(self._solid_color)); self.solid_preview.setPixmap(pm)
-        # Grad preview
-        gpm = QPixmap(120, 32); gp = QPainter(gpm); grad = QLinearGradient(0,0,120,0)
-        try:
-            grad.setColorAt(0.0, qcolor_from_hex(self._grad_stops[0][1])); grad.setColorAt(1.0, qcolor_from_hex(self._grad_stops[1][1]))
-        except Exception:
-            pass
-        gp.fillRect(gpm.rect(), grad); gp.end(); self.grad_preview.setPixmap(gpm)
-        # Texture preview
-        tpm = QPixmap(120, 32); tpm.fill(Qt.GlobalColor.transparent)
-        if self._tex_path:
-            pix = QPixmap(self._tex_path)
-            if not pix.isNull():
-                if self._tex_tile:
-                    brush = QBrush(pix)
-                    tp = QPainter(tpm); tp.fillRect(tpm.rect(), brush); tp.end()
-                else:
-                    s = pix.scaled(120, 32, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-                    tp = QPainter(tpm); tp.drawPixmap(0,0,s); tp.end()
-        self.tex_preview.setPixmap(tpm)
+    def _on_stop_selected_ui(self, pos, col):
+        if pos < 0: # Des-selected
+            self.stop_color_btn.setEnabled(False)
+            self.stop_pos_spin.setEnabled(False)
+            self.stop_del_btn.setEnabled(False)
+            self.stop_color_btn.setStyleSheet("")
+        else:
+            self.stop_color_btn.setEnabled(True)
+            self.stop_pos_spin.setEnabled(True)
+            self.stop_del_btn.setEnabled(True)
+            self.stop_color_btn.setStyleSheet(f"background-color: {col}; border: none;")
+            self.stop_pos_spin.blockSignals(True)
+            self.stop_pos_spin.setValue(pos * 100.0)
+            self.stop_pos_spin.blockSignals(False)
 
+    def _on_grad_changed_ui(self, stops):
+        self._notify_update()
+
+    def _pick_stop_color(self):
+        # Usar color actual del stop seleccionado
+        if self.grad_bar.selected_index == -1: return
+        _, curr_hex = self.grad_bar.stops[self.grad_bar.selected_index]
+        
+        dlg = QColorDialog(QColor(curr_hex), self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dlg.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+
+        def on_change():
+            curr = dlg.currentColor()
+            if curr.isValid():
+                new_hex = curr.name(QColor.NameFormat.HexRgb)
+                self.grad_bar.set_selected_stop_color(new_hex)
+                self.stop_color_btn.setStyleSheet(f"background-color: {new_hex}; border: none;")
+                # gradientChanged signal from grad_bar will trigger _notify_update
+        
+        dlg.currentColorChanged.connect(on_change)
+        t = QTimer(dlg)
+        t.timeout.connect(on_change)
+        t.start(100)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            on_change()
+
+
+    def _on_spin_pos_changed(self, val):
+        self.grad_bar.set_selected_stop_pos(val / 100.0)
+
+    # --- TEXTURE LOGIC ---
+    def _pick_texture(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Textura", "", "Imágenes (*.png *.jpg *.jpeg *.webp)")
+        if f:
+            self._tex_path = f
+            self.tex_path_lbl.setText(f)
+            self._update_tex_preview()
+            self._notify_update()
+
+    def _update_tex_preview(self):
+        if self._tex_path and os.path.exists(self._tex_path):
+            pm = QPixmap(self._tex_path)
+            if not pm.isNull():
+                self.tex_preview.setPixmap(pm.scaled(200, 100, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            else:
+                self.tex_preview.setText("Error cargando imagen")
+        else:
+            self.tex_preview.setText("(Sin imagen)")
+
+    # --- COMMON ---
     def _notify_update(self):
-        """Notifica al callback para actualizar la caja de texto en vivo."""
         if callable(self.on_update_callback):
-            try:
-                spec = self.get_current_spec()
-                self.on_update_callback(spec)
-            except Exception:
-                pass
+            self.on_update_callback(self.get_current_spec())
 
     def get_current_spec(self):
-        """Devuelve la especificación actual sin cerrar el diálogo."""
-        cur_tab = self.findChild(QTabWidget).currentIndex()
-        if cur_tab == 0:
+        idx = self.tabs.currentIndex()
+        if idx == 0:
             return {'fill_type': 'solid', 'fill': self._solid_color}
-        elif cur_tab == 1:
-            return {'fill_type': 'linear_gradient', 'gradient_stops': self._grad_stops, 'gradient_angle': int(self.grad_angle.value())}
+        elif idx == 1:
+            return {
+                'fill_type': 'linear_gradient',
+                'gradient_stops': self.grad_bar.get_stops(),
+                'gradient_angle': self.angle_spin.value()
+            }
         else:
-            return {'fill_type': 'texture', 'texture_path': self._tex_path, 'texture_tile': bool(self.tex_tile_chk.isChecked())}
+            return {
+                'fill_type': 'texture',
+                'texture_path': self._tex_path,
+                'texture_tile': self.tex_tile_chk.isChecked()
+            }
 
     def get_result(self):
         return self.get_current_spec()
+
 
 # ---------------- main ----------------
 def main():
