@@ -11,6 +11,7 @@ Cambios vs v3.29:
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict, replace
+from copy import deepcopy
 import json, math, sys, re, os, base64
 import urllib.request
 import urllib.error
@@ -455,12 +456,17 @@ def restore_from_snapshot(snap):
     for it, st in snap.items():
         it.style = st['style']; it.name = st['name']; it.setFont(it.style.to_qfont())
         it._apply_paragraph_to_doc(); it.setPos(st['pos']); it.setRotation(st['rot']); it.setTextWidth(st['width'])
+        it.sync_default_text_color()
         it.set_locked(st['locked'])
 
 def apply_to_selected(ctx: 'PageContext', items: List['StrokeTextItem'], name: str, apply_fn: Callable[[], None]):
     snap_before = snapshot_styles(items)
     def undo(): restore_from_snapshot(snap_before); ctx.scene.update()
-    def redo(): apply_fn(); ctx.scene.update()
+    def redo():
+        apply_fn()
+        for it in items:
+            it.sync_default_text_color()
+        ctx.scene.update()
     push_cmd(ctx.undo_stack, name, undo, redo)
 
 # ---------------- THEME / QSS ----------------
@@ -709,6 +715,15 @@ class StrokeTextItem(QGraphicsTextItem):
         self.setFont(style.to_qfont()); self._apply_paragraph_to_doc()
         self.setTextWidth(400); self.apply_shadow(); self.background_enabled = style.background_enabled
 
+    def sync_default_text_color(self):
+        """Mantiene el color de texto en sync sin mutar en paint (evita parpadeo)."""
+        try:
+            target = qcolor_from_hex(self.style.fill)
+            if self.defaultTextColor() != target:
+                self.setDefaultTextColor(target)
+        except Exception:
+            pass
+
     def set_locked(self, v: bool, global_lock: bool = False):
         self.locked = bool(v)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, (not self.locked) and (not global_lock))
@@ -801,9 +816,7 @@ class StrokeTextItem(QGraphicsTextItem):
             fill_type = getattr(self.style, 'fill_type', 'solid')
             
             if fill_type == 'solid':
-                # For solid, we use standard paint, but check if color needs update to avoid loops
-                if self.defaultTextColor() != target_fill:
-                    self.setDefaultTextColor(target_fill)
+                # For solid, rely on pre-synced defaultTextColor (avoid mutating in paint)
                 super().paint(painter, option, widget)
             else:
                 br = super().boundingRect()
@@ -884,8 +897,6 @@ class StrokeTextItem(QGraphicsTextItem):
 
         except Exception:
             # Fallback
-            if self.defaultTextColor() != target_fill:
-                self.setDefaultTextColor(target_fill)
             super().paint(painter, option, widget)
 
         try:
@@ -3901,9 +3912,8 @@ class MangaTextTool(QMainWindow):
                 item.style.gradient_angle = int(spec.get('gradient_angle', 0))
                 item.style.texture_path = spec.get('texture_path', '')
                 item.style.texture_tile = bool(spec.get('texture_tile', True))
+                item.sync_default_text_color()
                 item.update()
-                if ctx and ctx.scene:
-                    ctx.scene.update()
             except Exception:
                 pass
         
@@ -3917,6 +3927,7 @@ class MangaTextTool(QMainWindow):
             item.style.gradient_angle = old_snapshot['gradient_angle']
             item.style.texture_path = old_snapshot['texture_path']
             item.style.texture_tile = old_snapshot['texture_tile']
+            item.sync_default_text_color()
             item.update()
             if ctx and ctx.scene:
                 ctx.scene.update()
@@ -3934,6 +3945,7 @@ class MangaTextTool(QMainWindow):
             item.style.gradient_angle = old_snapshot['gradient_angle']
             item.style.texture_path = old_snapshot['texture_path']
             item.style.texture_tile = old_snapshot['texture_tile']
+            item.sync_default_text_color()
             item.update(); ctx and ctx.scene.update()
 
         def redo():
@@ -3943,6 +3955,7 @@ class MangaTextTool(QMainWindow):
             item.style.gradient_angle = int(new_spec.get('gradient_angle', 0))
             item.style.texture_path = new_spec.get('texture_path', '')
             item.style.texture_tile = bool(new_spec.get('texture_tile', True))
+            item.sync_default_text_color()
             item.update(); ctx and ctx.scene.update()
 
         push_cmd(ctx.undo_stack, "Cambiar relleno texto", undo, redo)
@@ -4903,6 +4916,7 @@ class FillChooserDialog(QDialog):
         self.resize(550, 480)
         self.style = style
         self.on_update_callback = on_update_callback
+        self._last_preview_spec = None
         
         # 1. Main Layout
         main_layout = QVBoxLayout(self)
@@ -5144,7 +5158,11 @@ class FillChooserDialog(QDialog):
     # --- COMMON ---
     def _notify_update(self):
         if callable(self.on_update_callback):
-            self.on_update_callback(self.get_current_spec())
+            spec = self.get_current_spec()
+            if self._last_preview_spec is not None and spec == self._last_preview_spec:
+                return
+            self._last_preview_spec = deepcopy(spec)
+            self.on_update_callback(spec)
 
     def get_current_spec(self):
         idx = self.tabs.currentIndex()
