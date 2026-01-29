@@ -85,9 +85,26 @@ ABOUT_LINKS = {
 }
 
 # ---- Actualizaciones (GitHub Releases + version.json) ----
-# Actualiza estos valores al publicar una nueva version.
-APP_VERSION = "5.3.8"
 UPDATE_JSON_URL = "https://raw.githubusercontent.com/Esteban-LC/W10-v5.3.7.3---copia-1.3/main/version.json"
+
+def _get_local_version() -> str:
+    """Lee la version desde version.json local (empaquetado con PyInstaller o script)."""
+    try:
+        if getattr(sys, 'frozen', False):
+            # PyInstaller extrae archivos a _MEIPASS
+            base_path = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+        else:
+            base_path = Path(__file__).parent
+        version_file = base_path / "version.json"
+        if version_file.exists():
+            with open(version_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return str(data.get("version", "0.0.0")).strip()
+    except Exception:
+        pass
+    return "0.0.0"
+
+APP_VERSION = _get_local_version()
 
 GSPREAD_CREDS = {
   "type": "service_account",
@@ -225,7 +242,7 @@ def icon(name: str) -> QIcon:
 ABOUT_INFO = {
     "YEAR": "2025",
     "PROJECT": "AnimeBBG Editor",
-    "REV": "AnimeBBG v5.3.2",
+    "REV": f"AnimeBBG v{APP_VERSION}",
     "MAINTAINERS": "https://example.com/maintainers",
     "CONTRIBUTORS": "https://example.com/contributors",
     "ARTWORK": "https://example.com/artist",
@@ -3265,7 +3282,7 @@ class MangaTextTool(QMainWindow):
         title.setStyleSheet("color:#f97316; font-size:25px;")
         grid.addWidget(title, 0, 1)
 
-        subtitle = QLabel("© 2025 – versión 5.3.8")
+        subtitle = QLabel(f"© 2025 – versión {APP_VERSION}")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet("color:#9ca3af; font-size:12px;")
         grid.addWidget(subtitle, 1, 1)
@@ -4660,26 +4677,604 @@ class MangaTextTool(QMainWindow):
             self.theme_btn.setIcon(icon('sun.png'))
             Theme.apply(app, dark=False, accent=app.property("accent_color") or "#E11D48", scale_factor=scale)
 
-# ---------------- Diálogo de fuentes por simbología ----------------
+
+# ---------------- Widgets de soporte para el Gestor de Estilos ----------------
+
+class StylePreviewWidget(QWidget):
+    """Widget que muestra una vista previa del estilo de texto."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(200, 80)
+        self.setMaximumHeight(100)
+        self._style: Optional[TextStyle] = None
+        self._text = "Ejemplo Abc"
+    
+    def set_style(self, style: TextStyle):
+        self._style = style
+        self.update()
+    
+    def set_preview_text(self, text: str):
+        self._text = text or "Ejemplo Abc"
+        self.update()
+    
+    def paintEvent(self, event):
+        if not self._style:
+            return
+        
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Fondo
+        p.fillRect(self.rect(), QColor("#1a1a2e"))
+        
+        # Configurar fuente
+        font = self._style.to_qfont()
+        preview_size = min(self._style.font_point_size, 28)
+        font.setPointSize(preview_size)
+        p.setFont(font)
+        
+        text = self._text
+        fm = p.fontMetrics()
+        text_rect = fm.boundingRect(text)
+        
+        x = (self.width() - text_rect.width()) // 2
+        y = (self.height() + fm.ascent() - fm.descent()) // 2
+        
+        # Dibujar outline si existe
+        if self._style.outline_width > 0:
+            outline_color = QColor(self._style.outline)
+            pen = QPen(outline_color, max(1, self._style.outline_width // 2))
+            p.setPen(pen)
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx != 0 or dy != 0:
+                        p.drawText(x + dx, y + dy, text)
+        
+        # Dibujar texto principal
+        p.setPen(QColor(self._style.fill))
+        p.drawText(x, y, text)
+        
+        p.end()
+
+
+class StyleEditorWidget(QWidget):
+    """Widget para editar todas las propiedades de un estilo."""
+    styleChanged = pyqtSignal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._style: Optional[TextStyle] = None
+        self._building = False
+        self._build_ui()
+    
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        
+        scroll = QWidget()
+        form = QFormLayout(scroll)
+        form.setSpacing(6)
+        
+        # Fuente
+        font_row = QHBoxLayout()
+        self.font_btn = QPushButton("Elegir fuente…")
+        self.font_btn.clicked.connect(self._pick_font)
+        self.font_label = QLabel("Arial")
+        self.font_label.setStyleSheet("color: #888; font-style: italic;")
+        font_row.addWidget(self.font_btn)
+        font_row.addWidget(self.font_label, 1)
+        form.addRow("Fuente:", font_row)
+        
+        # Tamaño
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(6, 200)
+        self.size_spin.setValue(34)
+        self.size_spin.valueChanged.connect(self._on_change)
+        form.addRow("Tamaño:", self.size_spin)
+        
+        # Negrita / Itálica
+        style_row = QHBoxLayout()
+        self.bold_chk = QCheckBox("Negrita")
+        self.bold_chk.stateChanged.connect(self._on_change)
+        self.italic_chk = QCheckBox("Itálica")
+        self.italic_chk.stateChanged.connect(self._on_change)
+        style_row.addWidget(self.bold_chk)
+        style_row.addWidget(self.italic_chk)
+        style_row.addStretch()
+        form.addRow("Estilo:", style_row)
+        
+        # Color de relleno
+        fill_row = QHBoxLayout()
+        self.fill_btn = QPushButton()
+        self.fill_btn.setFixedSize(60, 24)
+        self.fill_btn.clicked.connect(self._pick_fill_color)
+        self.fill_label = QLabel("#000000")
+        fill_row.addWidget(self.fill_btn)
+        fill_row.addWidget(self.fill_label)
+        fill_row.addStretch()
+        form.addRow("Color texto:", fill_row)
+        
+        # Color de trazo
+        outline_row = QHBoxLayout()
+        self.outline_btn = QPushButton()
+        self.outline_btn.setFixedSize(60, 24)
+        self.outline_btn.clicked.connect(self._pick_outline_color)
+        self.outline_label = QLabel("#FFFFFF")
+        outline_row.addWidget(self.outline_btn)
+        outline_row.addWidget(self.outline_label)
+        outline_row.addStretch()
+        form.addRow("Color trazo:", outline_row)
+        
+        # Grosor trazo
+        self.outline_width_spin = QSpinBox()
+        self.outline_width_spin.setRange(0, 20)
+        self.outline_width_spin.setValue(3)
+        self.outline_width_spin.valueChanged.connect(self._on_change)
+        form.addRow("Grosor trazo:", self.outline_width_spin)
+        
+        # Alineación
+        self.align_combo = QComboBox()
+        self.align_combo.addItems(["Izquierda", "Centro", "Derecha", "Justificar"])
+        self.align_combo.setCurrentIndex(1)
+        self.align_combo.currentIndexChanged.connect(self._on_change)
+        form.addRow("Alineación:", self.align_combo)
+        
+        # Interlineado
+        self.linespace_spin = QDoubleSpinBox()
+        self.linespace_spin.setRange(0.5, 3.0)
+        self.linespace_spin.setSingleStep(0.1)
+        self.linespace_spin.setValue(1.2)
+        self.linespace_spin.valueChanged.connect(self._on_change)
+        form.addRow("Interlineado:", self.linespace_spin)
+        
+        # Capitalización
+        self.cap_combo = QComboBox()
+        self.cap_combo.addItems(["Normal", "MAYÚSCULAS", "minúsculas", "Capitalizar", "Versalitas"])
+        self.cap_combo.currentIndexChanged.connect(self._on_change)
+        form.addRow("Capitalización:", self.cap_combo)
+        
+        # Sombra
+        self.shadow_chk = QCheckBox("Habilitar sombra")
+        self.shadow_chk.stateChanged.connect(self._on_change)
+        form.addRow("Sombra:", self.shadow_chk)
+        
+        layout.addWidget(scroll)
+    
+    def set_style(self, style: TextStyle):
+        self._building = True
+        self._style = style
+        
+        self.font_label.setText(style.font_family)
+        self.size_spin.setValue(style.font_point_size)
+        self.bold_chk.setChecked(style.bold)
+        self.italic_chk.setChecked(style.italic)
+        
+        self._update_color_btn(self.fill_btn, style.fill)
+        self.fill_label.setText(style.fill)
+        self._update_color_btn(self.outline_btn, style.outline)
+        self.outline_label.setText(style.outline)
+        
+        self.outline_width_spin.setValue(style.outline_width)
+        
+        align_map = {'left': 0, 'center': 1, 'right': 2, 'justify': 3}
+        self.align_combo.setCurrentIndex(align_map.get(style.alignment, 1))
+        
+        self.linespace_spin.setValue(style.line_spacing)
+        
+        cap_map = {'mixed': 0, 'uppercase': 1, 'lowercase': 2, 'capitalize': 3, 'smallcaps': 4}
+        self.cap_combo.setCurrentIndex(cap_map.get(style.capitalization, 0))
+        
+        self.shadow_chk.setChecked(style.shadow_enabled)
+        
+        self._building = False
+    
+    def get_style(self) -> Optional[TextStyle]:
+        return self._style
+    
+    def _update_color_btn(self, btn: QPushButton, color: str):
+        btn.setStyleSheet(f"background-color: {color}; border: 1px solid #555;")
+    
+    def _on_change(self):
+        if self._building or not self._style:
+            return
+        
+        self._style.font_point_size = self.size_spin.value()
+        self._style.bold = self.bold_chk.isChecked()
+        self._style.italic = self.italic_chk.isChecked()
+        self._style.outline_width = self.outline_width_spin.value()
+        
+        align_keys = ['left', 'center', 'right', 'justify']
+        self._style.alignment = align_keys[self.align_combo.currentIndex()]
+        
+        self._style.line_spacing = self.linespace_spin.value()
+        
+        cap_keys = ['mixed', 'uppercase', 'lowercase', 'capitalize', 'smallcaps']
+        self._style.capitalization = cap_keys[self.cap_combo.currentIndex()]
+        
+        self._style.shadow_enabled = self.shadow_chk.isChecked()
+        
+        self.styleChanged.emit()
+    
+    def _pick_font(self):
+        if not self._style:
+            return
+        cur = self._style.to_qfont()
+        font, ok = QFontDialog.getFont(cur, self, "Elegir fuente")
+        if ok:
+            self._style.font_family = font.family()
+            self._style.font_point_size = font.pointSize()
+            self._style.bold = font.bold()
+            self._style.italic = font.italic()
+            self.font_label.setText(font.family())
+            self.size_spin.setValue(font.pointSize())
+            self.bold_chk.setChecked(font.bold())
+            self.italic_chk.setChecked(font.italic())
+            self.styleChanged.emit()
+    
+    def _pick_fill_color(self):
+        if not self._style:
+            return
+        color = QColorDialog.getColor(QColor(self._style.fill), self, "Color de texto")
+        if color.isValid():
+            self._style.fill = color.name()
+            self._update_color_btn(self.fill_btn, color.name())
+            self.fill_label.setText(color.name())
+            self.styleChanged.emit()
+    
+    def _pick_outline_color(self):
+        if not self._style:
+            return
+        color = QColorDialog.getColor(QColor(self._style.outline), self, "Color de trazo")
+        if color.isValid():
+            self._style.outline = color.name()
+            self._update_color_btn(self.outline_btn, color.name())
+            self.outline_label.setText(color.name())
+            self.styleChanged.emit()
+
+
+# ---------------- Diálogo de fuentes por simbología (Mejorado estilo TypeR) ----------------
+
 class FontsPerPresetDialog(QDialog):
+    """Diálogo mejorado para gestionar estilos/fuentes por simbología (estilo TypeR)."""
+    
     def __init__(self, parent, presets: Dict[str, TextStyle]):
-        super().__init__(parent); self.setWindowTitle("Definir fuentes por simbología"); self.presets = presets
-        lay = QVBoxLayout(self); grid = QGridLayout(); lay.addLayout(grid)
-        self.font_btns = {}; self.size_spins = {}; row = 0
-        for key in presets.keys():
-            grid.addWidget(QLabel(key), row, 0)
-            btn = QPushButton("Elegir fuente…"); btn.clicked.connect(lambda _, k=key: self.pick_font(k))
-            grid.addWidget(btn, row, 1); self.font_btns[key] = btn
-            sp = QSpinBox(); sp.setRange(6, 200); sp.setValue(presets[key].font_point_size)
-            grid.addWidget(sp, row, 2); self.size_spins[key] = sp; row += 1
-        self.apply_chk = QCheckBox("Aplicar a elementos existentes de cada tipo"); lay.addWidget(self.apply_chk)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
-    def pick_font(self, k: str):
-        cur = self.presets[k].to_qfont(); font, ok = QFontDialog.getFont(cur, self, f"Fuente para {k}")
-        if ok: self.presets[k].font_family = font.family()
-    def apply_changes(self):
-        for k, sp in self.size_spins.items(): self.presets[k].font_point_size = int(sp.value())
+        super().__init__(parent)
+        self.setWindowTitle("Gestor de Estilos – Definir fuentes por simbología")
+        self.setMinimumSize(800, 600)
+        self.presets = presets
+        self._current_key: Optional[str] = None
+        self._apply_existing = False
+        
+        self._build_ui()
+        self._populate_list()
+        
+        # Seleccionar el primero
+        if self.style_list.count() > 0:
+            self.style_list.setCurrentRow(0)
+    
+    def _build_ui(self):
+        # Layout principal vertical
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(12)
+        
+        # === Contenedor horizontal para los dos paneles ===
+        panels_widget = QWidget()
+        panels_layout = QHBoxLayout(panels_widget)
+        panels_layout.setContentsMargins(0, 0, 0, 0)
+        panels_layout.setSpacing(12)
+        
+        # === Panel izquierdo: Lista de estilos ===
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Título
+        title_lbl = QLabel("Estilos disponibles")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 14px;")
+        left_layout.addWidget(title_lbl)
+        
+        # Lista de estilos
+        self.style_list = QListWidget()
+        self.style_list.setMinimumWidth(200)
+        self.style_list.currentRowChanged.connect(self._on_style_selected)
+        left_layout.addWidget(self.style_list)
+        
+        # Botones de gestión
+        btn_row = QHBoxLayout()
+        
+        self.add_btn = QPushButton("➕ Nuevo")
+        self.add_btn.setToolTip("Crear nuevo estilo")
+        self.add_btn.clicked.connect(self._add_style)
+        btn_row.addWidget(self.add_btn)
+        
+        self.dup_btn = QPushButton("📋 Duplicar")
+        self.dup_btn.setToolTip("Duplicar estilo seleccionado")
+        self.dup_btn.clicked.connect(self._duplicate_style)
+        btn_row.addWidget(self.dup_btn)
+        
+        self.del_btn = QPushButton("🗑️ Eliminar")
+        self.del_btn.setToolTip("Eliminar estilo seleccionado")
+        self.del_btn.clicked.connect(self._delete_style)
+        btn_row.addWidget(self.del_btn)
+        
+        left_layout.addLayout(btn_row)
+        
+        # Botones de importar/exportar
+        io_row = QHBoxLayout()
+        
+        self.export_btn = QPushButton("📤 Exportar")
+        self.export_btn.setToolTip("Exportar estilo seleccionado a JSON")
+        self.export_btn.clicked.connect(self._export_style)
+        io_row.addWidget(self.export_btn)
+        
+        self.import_btn = QPushButton("📥 Importar")
+        self.import_btn.setToolTip("Importar estilo desde JSON")
+        self.import_btn.clicked.connect(self._import_style)
+        io_row.addWidget(self.import_btn)
+        
+        left_layout.addLayout(io_row)
+        
+        # Restaurar defaults
+        self.reset_btn = QPushButton("🔄 Restaurar defaults")
+        self.reset_btn.setToolTip("Restaurar estilos predeterminados")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        left_layout.addWidget(self.reset_btn)
+        
+        panels_layout.addWidget(left_panel)
+        
+        # === Panel derecho: Editor de estilo ===
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Nombre del estilo
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Nombre:"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Nombre del estilo")
+        self.name_edit.textChanged.connect(self._on_name_changed)
+        name_row.addWidget(self.name_edit)
+        right_layout.addLayout(name_row)
+        
+        # Vista previa
+        preview_group = QFrame()
+        preview_group.setStyleSheet("QFrame { background: #1a1a2e; border: 1px solid #333; border-radius: 6px; }")
+        preview_layout = QVBoxLayout(preview_group)
+        
+        preview_title = QLabel("Vista previa")
+        preview_title.setStyleSheet("color: #888; font-size: 11px; background: transparent; border: none;")
+        preview_layout.addWidget(preview_title)
+        
+        self.preview_widget = StylePreviewWidget()
+        preview_layout.addWidget(self.preview_widget)
+        
+        right_layout.addWidget(preview_group)
+        
+        # Editor de propiedades
+        editor_group = QFrame()
+        editor_group.setStyleSheet("QFrame { border: 1px solid #333; border-radius: 6px; }")
+        editor_layout = QVBoxLayout(editor_group)
+        
+        self.style_editor = StyleEditorWidget()
+        self.style_editor.styleChanged.connect(self._on_style_changed)
+        editor_layout.addWidget(self.style_editor)
+        
+        right_layout.addWidget(editor_group, 1)
+        
+        panels_layout.addWidget(right_panel, 1)
+        
+        # Añadir paneles al layout principal
+        main_layout.addWidget(panels_widget, 1)
+        
+        # === Botones de diálogo (abajo) ===
+        self.apply_chk = QCheckBox("Aplicar cambios a elementos existentes de cada tipo")
+        main_layout.addWidget(self.apply_chk)
+        
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        main_layout.addWidget(btn_box)
+    
+    def _populate_list(self):
+        self.style_list.clear()
+        for key in self.presets.keys():
+            item = QListWidgetItem(key)
+            self.style_list.addItem(item)
+    
+    def _on_style_selected(self, row: int):
+        if row < 0:
+            self._current_key = None
+            return
+        
+        self._current_key = self.style_list.item(row).text()
+        style = self.presets.get(self._current_key)
+        
+        if style:
+            self.name_edit.blockSignals(True)
+            self.name_edit.setText(self._current_key)
+            self.name_edit.blockSignals(False)
+            
+            self.style_editor.set_style(style)
+            self.preview_widget.set_style(style)
+    
+    def _on_style_changed(self):
+        if self._current_key and self._current_key in self.presets:
+            self.preview_widget.set_style(self.presets[self._current_key])
+    
+    def _on_name_changed(self, new_name: str):
+        if not self._current_key or not new_name.strip():
+            return
+        
+        new_name = new_name.strip().upper()
+        
+        if new_name == self._current_key:
+            return
+        
+        if new_name in self.presets:
+            return
+        
+        # Renombrar
+        style = self.presets.pop(self._current_key)
+        self.presets[new_name] = style
+        self._current_key = new_name
+        
+        # Actualizar lista
+        current_row = self.style_list.currentRow()
+        self.style_list.item(current_row).setText(new_name)
+    
+    def _add_style(self):
+        name, ok = self._get_unique_name("NUEVO_ESTILO")
+        if not ok:
+            return
+        
+        # Crear estilo con valores por defecto
+        new_style = TextStyle()
+        self.presets[name] = new_style
+        
+        # Añadir a la lista y seleccionar
+        item = QListWidgetItem(name)
+        self.style_list.addItem(item)
+        self.style_list.setCurrentItem(item)
+    
+    def _duplicate_style(self):
+        if not self._current_key:
+            return
+        
+        name, ok = self._get_unique_name(f"{self._current_key}_COPIA")
+        if not ok:
+            return
+        
+        # Duplicar el estilo actual
+        original = self.presets[self._current_key]
+        new_style = replace(original)
+        self.presets[name] = new_style
+        
+        # Añadir a la lista y seleccionar
+        item = QListWidgetItem(name)
+        self.style_list.addItem(item)
+        self.style_list.setCurrentItem(item)
+    
+    def _delete_style(self):
+        if not self._current_key:
+            return
+        
+        # No permitir eliminar si solo queda uno
+        if len(self.presets) <= 1:
+            QMessageBox.warning(self, "No se puede eliminar", 
+                              "Debe haber al menos un estilo.")
+            return
+        
+        reply = QMessageBox.question(
+            self, "Confirmar eliminación",
+            f"¿Eliminar el estilo '{self._current_key}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            del self.presets[self._current_key]
+            row = self.style_list.currentRow()
+            self.style_list.takeItem(row)
+            
+            if self.style_list.count() > 0:
+                self.style_list.setCurrentRow(0)
+    
+    def _export_style(self):
+        if not self._current_key:
+            return
+        
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Exportar estilo '{self._current_key}'",
+            f"{self._current_key}.json", "JSON (*.json)"
+        )
+        
+        if path:
+            style = self.presets[self._current_key]
+            data = {self._current_key: asdict(style)}
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Exportado", 
+                                   f"Estilo exportado a:\n{path}")
+    
+    def _import_style(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Importar estilo", "", "JSON (*.json)"
+        )
+        
+        if not path:
+            return
+        
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            imported = 0
+            for key, val in data.items():
+                # Si ya existe, preguntar
+                if key in self.presets:
+                    reply = QMessageBox.question(
+                        self, "Estilo existente",
+                        f"El estilo '{key}' ya existe. ¿Sobrescribir?",
+                        QMessageBox.StandardButton.Yes | 
+                        QMessageBox.StandardButton.No |
+                        QMessageBox.StandardButton.Cancel
+                    )
+                    if reply == QMessageBox.StandardButton.Cancel:
+                        return
+                    if reply == QMessageBox.StandardButton.No:
+                        continue
+                
+                self.presets[key] = TextStyle(**val)
+                imported += 1
+            
+            self._populate_list()
+            QMessageBox.information(self, "Importado", 
+                                   f"Se importaron {imported} estilo(s).")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error al importar:\n{e}")
+    
+    def _reset_defaults(self):
+        reply = QMessageBox.question(
+            self, "Restaurar defaults",
+            "¿Restaurar todos los estilos predeterminados?\n"
+            "Los estilos personalizados se mantendrán.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            defaults = default_presets()
+            for key, style in defaults.items():
+                self.presets[key] = style
+            
+            self._populate_list()
+            if self.style_list.count() > 0:
+                self.style_list.setCurrentRow(0)
+    
+    def _get_unique_name(self, base: str) -> tuple:
+        """Pide un nombre único para el estilo."""
+        name = base
+        counter = 1
+        while name in self.presets:
+            name = f"{base}_{counter}"
+            counter += 1
+        
+        text, ok = QLineEdit.getText(
+            QLineEdit(), "Nombre del estilo", "Nombre:", 
+            QLineEdit.EchoMode.Normal, name
+        ) if False else (name, True)  # Simplificado: usar nombre generado
+        
+        # Validar
+        if ok:
+            name = name.strip().upper()
+            if not name:
+                return "", False
+        
+        return name, ok
+    
+    def apply_changes(self) -> bool:
         return self.apply_chk.isChecked()
 
 
