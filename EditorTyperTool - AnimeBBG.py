@@ -34,7 +34,7 @@ from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
     QPixmap, QTextCursor, QTextDocument, QTextOption, QShortcut, QKeySequence,
     QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor, QLinearGradient, QBrush,
-    QFontDatabase, QTextCharFormat, QAbstractTextDocumentLayout, QPalette
+    QFontDatabase, QTextCharFormat, QAbstractTextDocumentLayout, QPalette, QFontMetricsF
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsDropShadowEffect, QGraphicsItem,
@@ -632,6 +632,7 @@ class TextStyle:
     shadow_blur: int = 8
     alignment: str = "center"
     line_spacing: float = 1.2
+    auto_hyphenate: bool = True
     background_enabled: bool = False
     background_color: str = "#FFFFFF"
     background_opacity: float = 0.0
@@ -782,6 +783,8 @@ class StrokeTextItem(QGraphicsTextItem):
     ROT_MIN_RADIUS = 60
     ROT_SENSITIVITY = 0.20
     SHOW_ORDINAL = True
+    SOFT_HYPHEN = "\u00AD"
+    _WORD_RX = re.compile(r"[A-Za-zÁÉÍÓÚÜÑñ]+", re.UNICODE)
     def __init__(self, text: str, style: TextStyle, name: str = "Texto"):
         super().__init__(text)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -801,9 +804,118 @@ class StrokeTextItem(QGraphicsTextItem):
         self._resizing = False; self._resize_start_width = 0.0; self._resize_start_pos = QPointF(0, 0)
         self._resize_alt_scale = False; self._start_font_pt = float(style.font_point_size); self._start_outline = float(style.outline_width)
         self._rotating = False; self._rot_start_angle = 0.0; self._rot_base = 0.0
+        self._hyphenating = False
+        self._raw_text = self._strip_soft_hyphens(text)
         # Aplicar fuente (Sin cambiar a fallback automático — solo detectar para advertencia)
         self.setFont(style.to_qfont()); self._apply_paragraph_to_doc()
         self.setTextWidth(400); self.apply_shadow(); self.background_enabled = style.background_enabled
+        self._update_soft_hyphens()
+
+    def _strip_soft_hyphens(self, text: str) -> str:
+        return (text or "").replace(self.SOFT_HYPHEN, "")
+
+    def get_raw_text(self) -> str:
+        if self._raw_text is not None:
+            return self._raw_text
+        return self._strip_soft_hyphens(super().toPlainText())
+
+    def setPlainText(self, text: str) -> None:
+        raw = self._strip_soft_hyphens(text)
+        self._raw_text = raw
+        super().setPlainText(raw)
+        self._apply_paragraph_to_doc()
+        self._update_soft_hyphens()
+
+    def setTextWidth(self, width: float) -> None:
+        super().setTextWidth(width)
+        self._update_soft_hyphens()
+
+    def setFont(self, font: QFont) -> None:
+        super().setFont(font)
+        self._update_soft_hyphens()
+
+    def _compute_soft_hyphen_positions(self, text: str) -> List[int]:
+        if not text:
+            return []
+        max_width = float(self.textWidth() or 0)
+        if max_width <= 0:
+            return []
+        fm = QFontMetricsF(self.font())
+        avg = float(fm.averageCharWidth() or 0)
+        if avg <= 0:
+            return []
+        hyphen_w = float(fm.horizontalAdvance("-") or 0)
+        usable = max(0.0, max_width - hyphen_w)
+        max_chars = int(usable / avg)
+        max_chars = max(3, max_chars)
+        positions: List[int] = []
+        offset = 0
+        for line in text.splitlines(True):
+            if line.endswith("\r\n"):
+                core = line[:-2]; line_end = "\r\n"
+            elif line.endswith("\n") or line.endswith("\r"):
+                core = line[:-1]; line_end = line[-1]
+            else:
+                core = line; line_end = ""
+            for m in self._WORD_RX.finditer(core):
+                word = m.group(0)
+                if len(word) <= max_chars + 1:
+                    continue
+                start = m.start()
+                i = max_chars
+                while len(word) - i > 2:
+                    remaining = len(word) - i
+                    if remaining < 3:
+                        break
+                    if remaining < 3 and i > 3:
+                        i -= 1
+                    positions.append(offset + start + i)
+                    i += max_chars
+            offset += len(core) + len(line_end)
+        return positions
+
+    def _update_soft_hyphens(self):
+        if self._hyphenating:
+            return
+        if self.textInteractionFlags() == Qt.TextInteractionFlag.TextEditorInteraction:
+            return
+        doc = self.document()
+        if doc is None:
+            return
+        self._hyphenating = True
+        try:
+            text = doc.toPlainText()
+            if self.SOFT_HYPHEN in text:
+                cur = QTextCursor(doc)
+                for pos in [i for i, ch in enumerate(text) if ch == self.SOFT_HYPHEN][::-1]:
+                    cur.setPosition(pos)
+                    cur.deleteChar()
+                text = doc.toPlainText()
+            self._raw_text = text
+            if not getattr(self.style, 'auto_hyphenate', False):
+                return
+            positions = self._compute_soft_hyphen_positions(text)
+            if positions:
+                cur = QTextCursor(doc)
+                for pos in sorted(positions, reverse=True):
+                    cur.setPosition(pos)
+                    cur.insertText(self.SOFT_HYPHEN)
+        finally:
+            self._hyphenating = False
+
+    def _clear_soft_hyphens(self):
+        doc = self.document()
+        if doc is None:
+            return
+        text = doc.toPlainText()
+        if self.SOFT_HYPHEN not in text:
+            self._raw_text = text
+            return
+        cur = QTextCursor(doc)
+        for pos in [i for i, ch in enumerate(text) if ch == self.SOFT_HYPHEN][::-1]:
+            cur.setPosition(pos)
+            cur.deleteChar()
+        self._raw_text = doc.toPlainText()
 
     def sync_default_text_color(self):
         """Mantiene el color de texto en sync sin mutar en paint (evita parpadeo)."""
@@ -1175,7 +1287,8 @@ class StrokeTextItem(QGraphicsTextItem):
             if self._hit_rot_corner(event.pos()): event.accept(); return
             c = self._rot_handle_center()
             if (event.pos() - c).manhattanLength() <= self.ROT_HANDLE_R + 3: event.accept(); return
-        self._old_text = self.toPlainText()
+        self._clear_soft_hyphens()
+        self._old_text = self.get_raw_text()
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         # Deja que Qt maneje la posición del cursor según el clic
@@ -1185,13 +1298,15 @@ class StrokeTextItem(QGraphicsTextItem):
         super().focusOutEvent(event)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         scene = self.scene()
+        self._raw_text = self._strip_soft_hyphens(self.document().toPlainText())
         if scene and hasattr(scene, 'undo_stack'):
-            new = self.toPlainText()
+            new = self.get_raw_text()
             if new != self._old_text:
                 item = self; old = self._old_text; stack = scene.undo_stack
                 push_cmd(stack, "Editar texto",
                          lambda: (item.setPlainText(old), item._apply_paragraph_to_doc()),
                          lambda: (item.setPlainText(new), item._apply_paragraph_to_doc()))
+        self._update_soft_hyphens()
 
     def apply_bold_to_selection(self):
         """Aplica negrita solo al texto seleccionado (no a toda la caja)."""
@@ -1227,7 +1342,7 @@ class StrokeTextItem(QGraphicsTextItem):
         return {
             'name': self.name,
             'pos': [self.pos().x(), self.pos().y()],
-            'text': self.toPlainText(),
+            'text': self.get_raw_text(),
             'width': self.textWidth(),
             'rotation': self.rotation(),
             'locked': bool(self.locked),
@@ -3505,6 +3620,11 @@ class MangaTextTool(QMainWindow):
         linespace_layout.addWidget(self.linespace_label)
         layout.addRow("Interlineado", linespace_layout)
 
+        self.hyphen_chk = QCheckBox("Guionado automático")
+        self.hyphen_chk.setToolTip("Inserta guiones suaves para cortar palabras largas sin desbordar")
+        self.hyphen_chk.stateChanged.connect(self.on_hyphenate_toggle)
+        layout.addRow(self.hyphen_chk)
+
 
 
         # Capitalización
@@ -3777,7 +3897,7 @@ class MangaTextTool(QMainWindow):
     def _auto_fit_text_item_to_rect(self, item: 'StrokeTextItem', rect: QRectF,
                                     min_pt: int = 6, max_pt: Optional[int] = None):
         """Ajusta el tamaño de fuente para que el texto quepa dentro del rect."""
-        text = item.toPlainText().strip()
+        text = item.get_raw_text().strip()
         if not text:
             return
 
@@ -3849,7 +3969,7 @@ class MangaTextTool(QMainWindow):
     # ---------------- Propiedades ----------------
     def _sync_props_from_item(self, item: StrokeTextItem):
         bs = [self.width_spin, self.outw_slider, self.align_combo, self.linespace_slider,
-              self.symb_combo, self.no_stroke_chk,
+              self.symb_combo, self.no_stroke_chk, self.hyphen_chk,
               self.shadow_chk, self.bg_chk, self.bg_op, self.cap_combo, self.bold_chk]
         for w in bs: w.blockSignals(True)
 
@@ -3903,7 +4023,9 @@ class MangaTextTool(QMainWindow):
         linespace_value = int(float(item.style.line_spacing) * 100)
         self.linespace_slider.setValue(linespace_value)
         self.linespace_label.setText(f"{linespace_value/100:.2f}")
-        
+
+        self.hyphen_chk.setChecked(bool(getattr(item.style, 'auto_hyphenate', False)))
+
 
         self.shadow_chk.setChecked(bool(item.style.shadow_enabled))
         self.bg_chk.setChecked(bool(item.style.background_enabled))
@@ -3955,6 +4077,14 @@ class MangaTextTool(QMainWindow):
         new = float(val)
         apply_to_selected(ctx, items, "Interlineado (varias)",
                           lambda: [setattr(it.style, 'line_spacing', new) or it._apply_paragraph_to_doc()
+                                   for it in items])
+
+    def on_hyphenate_toggle(self, state: int):
+        items = self._selected_items(); ctx = self.current_ctx()
+        if not items or not ctx: return
+        new = bool(state)
+        apply_to_selected(ctx, items, "Guionado automático",
+                          lambda: [setattr(it.style, 'auto_hyphenate', new) or it._update_soft_hyphens()
                                    for it in items])
 
     def on_rotation_changed(self, deg: float):
@@ -4817,7 +4947,7 @@ class MangaTextTool(QMainWindow):
                 core = line.strip(); core = core[:1].upper() + core[1:].lower() if core else core
                 out.append(line[:prefix_len] + core + line[len(line)-suffix_len:])
             return "\n".join(out)
-        prev = [it.toPlainText() for it in items]; new = [sentence_case(t) for t in prev]
+        prev = [it.get_raw_text() for it in items]; new = [sentence_case(t) for t in prev]
         def do():
             for it, newt in zip(items, new):
                 it.setPlainText(newt); it._apply_paragraph_to_doc()
@@ -4984,6 +5114,10 @@ class StyleEditorWidget(QWidget):
         self.linespace_spin.setValue(1.2)
         self.linespace_spin.valueChanged.connect(self._on_change)
         form.addRow("Interlineado:", self.linespace_spin)
+
+        self.hyphen_chk = QCheckBox("Guionado automático")
+        self.hyphen_chk.stateChanged.connect(self._on_change)
+        form.addRow("Guionado:", self.hyphen_chk)
         
         # Capitalización
         self.cap_combo = QComboBox()
@@ -5018,6 +5152,8 @@ class StyleEditorWidget(QWidget):
         self.align_combo.setCurrentIndex(align_map.get(style.alignment, 1))
         
         self.linespace_spin.setValue(style.line_spacing)
+
+        self.hyphen_chk.setChecked(bool(getattr(style, 'auto_hyphenate', False)))
         
         cap_map = {'mixed': 0, 'uppercase': 1, 'lowercase': 2, 'capitalize': 3, 'smallcaps': 4}
         self.cap_combo.setCurrentIndex(cap_map.get(style.capitalization, 0))
@@ -5045,6 +5181,8 @@ class StyleEditorWidget(QWidget):
         self._style.alignment = align_keys[self.align_combo.currentIndex()]
         
         self._style.line_spacing = self.linespace_spin.value()
+
+        self._style.auto_hyphenate = self.hyphen_chk.isChecked()
         
         cap_keys = ['mixed', 'uppercase', 'lowercase', 'capitalize', 'smallcaps']
         self._style.capitalization = cap_keys[self.cap_combo.currentIndex()]
