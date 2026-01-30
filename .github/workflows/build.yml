@@ -39,18 +39,27 @@ jobs:
 
       - name: Build with PyInstaller (spec)
         run: |
-          pyinstaller --noconfirm --clean "EditorTyperTool-AnimeBBG.spec"
+          pyinstaller --noconfirm --clean --onedir --windowed ^
+            --name "EditorTyperTool-AnimeBBG" ^
+            --add-data "assets;assets" ^
+            "EditorTyperTool - AnimeBBG.py"
+
+      - name: Zip dist folder
+        shell: powershell
+        run: |
+          if (Test-Path "dist/EditorTyperTool-AnimeBBG.zip") { Remove-Item "dist/EditorTyperTool-AnimeBBG.zip" -Force }
+          Compress-Archive -Path "dist/EditorTyperTool-AnimeBBG/*" -DestinationPath "dist/EditorTyperTool-AnimeBBG.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: EditorTyperTool-AnimeBBG
-          path: dist/EditorTyperTool-AnimeBBG.exe
+          path: dist/EditorTyperTool-AnimeBBG.zip
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/EditorTyperTool-AnimeBBG.exe
+          files: dist/EditorTyperTool-AnimeBBG.zip
           generate_release_notes: true
 
       - name: Update version.json with release URL
@@ -58,7 +67,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           REPO="${{ github.repository }}"
-          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.zip"
           
           # Actualizar version.json
           cat > version.json << EOF

@@ -26,6 +26,8 @@ import webbrowser
 from pathlib import Path
 import threading
 from queue import Queue
+import zipfile
+import shutil
 
 
 from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer, pyqtSignal
@@ -267,8 +269,21 @@ def _download_file(url: str, dest: Path, timeout: int = 15) -> None:
                 break
             f.write(chunk)
 
+def _find_update_payload(extract_dir: Path, exe_name: str) -> Optional[Path]:
+    if (extract_dir / exe_name).exists():
+        return extract_dir
+    # Single top-level folder
+    children = [p for p in extract_dir.iterdir() if p.is_dir()]
+    if len(children) == 1 and (children[0] / exe_name).exists():
+        return children[0]
+    # Deep search
+    for root, _dirs, files in os.walk(extract_dir):
+        if exe_name in files:
+            return Path(root)
+    return None
+
 def _run_self_update(download_url: str, parent: Optional[QMainWindow] = None) -> None:
-    """Descarga el nuevo .exe y reemplaza el actual mediante un .bat auxiliar."""
+    """Descarga la nueva versión y reemplaza la instalación actual mediante un .bat auxiliar."""
     if not getattr(sys, "frozen", False):
         QMessageBox.information(
             parent or None,
@@ -287,17 +302,56 @@ def _run_self_update(download_url: str, parent: Optional[QMainWindow] = None) ->
     try:
         tmp_dir = Path(tempfile.gettempdir()) / "animebbg_update"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        new_exe = tmp_dir / f"{exe_path.name}.new"
+        is_zip = download_url.lower().endswith(".zip")
 
-        _download_file(download_url, new_exe)
+        if is_zip:
+            zip_path = tmp_dir / "update.zip"
+            extract_dir = tmp_dir / "extract"
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            extract_dir.mkdir(parents=True, exist_ok=True)
 
-        if not new_exe.exists() or new_exe.stat().st_size == 0:
-            raise RuntimeError("Descarga incompleta.")
+            _download_file(download_url, zip_path)
+            if not zip_path.exists() or zip_path.stat().st_size == 0:
+                raise RuntimeError("Descarga incompleta.")
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(extract_dir)
+
+            payload_dir = _find_update_payload(extract_dir, exe_path.name)
+            if not payload_dir:
+                raise RuntimeError("No se encontró el ejecutable dentro del ZIP.")
+        else:
+            new_exe = tmp_dir / f"{exe_path.name}.new"
+            _download_file(download_url, new_exe)
+            if not new_exe.exists() or new_exe.stat().st_size == 0:
+                raise RuntimeError("Descarga incompleta.")
 
         updater_bat = tmp_dir / "update_animebbg.bat"
         pid = os.getpid()
 
-        bat_contents = f"""@echo off
+        if is_zip:
+            app_dir = exe_path.parent
+            payload = payload_dir
+            bat_contents = f"""@echo off
+setlocal
+set EXE="{exe_path}"
+set APPDIR="{app_dir}"
+set NEWDIR="{payload}"
+set PID={pid}
+:waitloop
+tasklist /FI "PID eq %PID%" | find "%PID%" >nul
+if not errorlevel 1 (
+    timeout /t 1 >nul
+    goto waitloop
+)
+robocopy %NEWDIR% %APPDIR% /MIR /NFL /NDL /NJH /NJS /NC /NS >nul
+start "" %EXE%
+del "%~f0"
+endlocal
+"""
+        else:
+            bat_contents = f"""@echo off
 setlocal
 set NEW="{new_exe}"
 set EXE="{exe_path}"
