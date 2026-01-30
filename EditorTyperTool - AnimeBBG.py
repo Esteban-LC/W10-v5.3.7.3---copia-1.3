@@ -15,6 +15,8 @@ from copy import deepcopy
 import json, math, sys, re, os, base64
 import urllib.request
 import urllib.error
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Callable
 import socket
@@ -283,6 +285,87 @@ def _is_newer_version(remote: str, local: str) -> bool:
     r += (0,) * (max_len - len(r))
     l += (0,) * (max_len - len(l))
     return r > l
+
+def _download_file(url: str, dest: Path, timeout: int = 15) -> None:
+    """Descarga un archivo a disco."""
+    req = urllib.request.Request(url, headers={"User-Agent": "AnimeBBG-Editor"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            f.write(chunk)
+
+def _run_self_update(download_url: str, parent: Optional[QMainWindow] = None) -> None:
+    """Descarga el nuevo .exe y reemplaza el actual mediante un .bat auxiliar."""
+    if not getattr(sys, "frozen", False):
+        QMessageBox.information(
+            parent or None,
+            "Actualización",
+            "La actualización automática solo funciona en el ejecutable.\n"
+            "Se abrirá la descarga manual."
+        )
+        webbrowser.open(download_url)
+        return
+
+    exe_path = Path(sys.executable)
+    if not exe_path.exists():
+        QMessageBox.warning(parent or None, "Actualización", "No se encontró el ejecutable actual.")
+        return
+
+    try:
+        tmp_dir = Path(tempfile.gettempdir()) / "animebbg_update"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        new_exe = tmp_dir / f"{exe_path.name}.new"
+
+        _download_file(download_url, new_exe)
+
+        if not new_exe.exists() or new_exe.stat().st_size == 0:
+            raise RuntimeError("Descarga incompleta.")
+
+        updater_bat = tmp_dir / "update_animebbg.bat"
+        pid = os.getpid()
+
+        bat_contents = f"""@echo off
+setlocal
+set NEW="{new_exe}"
+set EXE="{exe_path}"
+set PID={pid}
+:waitloop
+tasklist /FI "PID eq %PID%" | find "%PID%" >nul
+if not errorlevel 1 (
+    timeout /t 1 >nul
+    goto waitloop
+)
+copy /y %NEW% %EXE% >nul
+start "" %EXE%
+del %NEW%
+del "%~f0"
+endlocal
+"""
+        updater_bat.write_text(bat_contents, encoding="utf-8")
+
+        subprocess.Popen(
+            ["cmd", "/c", str(updater_bat)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True
+        )
+
+        QMessageBox.information(
+            parent or None,
+            "Actualización",
+            "La actualización se descargó. La aplicación se cerrará y se reiniciará sola."
+        )
+        app = QApplication.instance()
+        if app:
+            app.quit()
+        sys.exit(0)
+    except Exception as e:
+        QMessageBox.warning(
+            parent or None,
+            "Actualización",
+            f"No se pudo actualizar automáticamente:\n{e}"
+        )
 
 # ---- Font Utilities ----
 def is_font_installed(family_name: str) -> bool:
@@ -642,13 +725,28 @@ _RE_NERV = re.compile(r'^\s*TEXTO[_\s]?NERVIOSO\s*:\s*(.+)$', re.IGNORECASE)
 
 def parse_identifier(line: str):
     s = line.strip()
+    # Casos especiales para reconocer el tipo y dejar solo el texto
+    m = _RE_PENS_1.match(s)
+    if m:
+        return 'PENSAMIENTO', m.group(1).strip()
+    m = _RE_PENS_2.match(s)
+    if m:
+        return 'PENSAMIENTO', m.group(1).strip()
+    m = _RE_CUADRO_1.match(s)
+    if m:
+        return 'CUADRO', m.group(1).strip()
+    m = _RE_CUADRO_2.match(s)
+    if m:
+        return 'CUADRO', m.group(1).strip()
+
     for rx, key in [
-        (_RE_GLOBO, 'GLOBO'), (_RE_NT, 'N/T'), (_RE_FUERA, 'FUERA_GLOBO'), (_RE_PENS_1, 'PENSAMIENTO'),
-        (_RE_PENS_2, 'PENSAMIENTO'), (_RE_CUADRO_1, 'CUADRO'), (_RE_CUADRO_2, 'CUADRO'), (_RE_TITULO, 'TITULO'),
-        (_RE_GRITOS, 'GRITOS'), (_RE_GEMIDOS, 'GEMIDOS'), (_RE_ONO, 'ONOMATOPEYAS'), (_RE_NERV, 'TEXTO_NERVIOSO'),
+        (_RE_GLOBO, 'GLOBO'), (_RE_NT, 'N/T'), (_RE_FUERA, 'FUERA_GLOBO'),
+        (_RE_TITULO, 'TITULO'), (_RE_GRITOS, 'GRITOS'), (_RE_GEMIDOS, 'GEMIDOS'),
+        (_RE_ONO, 'ONOMATOPEYAS'), (_RE_NERV, 'TEXTO_NERVIOSO'),
     ]:
         m = rx.match(s)
-        if m: return key, m.group(1).strip()
+        if m:
+            return key, m.group(1).strip()
     if s.startswith('N/T:'): return 'N/T', s[4:].lstrip()
     if s.startswith('Globo X:'): return 'GLOBO', s[len('Globo X:'):].lstrip()
     if s.startswith('():'): return 'PENSAMIENTO', s[3:].lstrip()
@@ -708,6 +806,10 @@ class MovableImageLayer(QGraphicsPixmapItem):
 # ---------------- Ítem de texto ----------------
 class StrokeTextItem(QGraphicsTextItem):
     HANDLE_SIZE = 10; ROT_HANDLE_R = 7
+    ROT_CORNER_R = 5
+    ROT_CORNER_OFFSET = 10
+    ROT_MIN_RADIUS = 60
+    ROT_SENSITIVITY = 0.20
     SHOW_ORDINAL = True
     def __init__(self, text: str, style: TextStyle, name: str = "Texto"):
         super().__init__(text)
@@ -774,13 +876,29 @@ class StrokeTextItem(QGraphicsTextItem):
         return QRectF(br.right()-s, br.bottom()-s, s, s)
     def _rot_handle_center(self) -> QPointF:
         br = super().boundingRect(); return QPointF((br.left()+br.right())/2.0, br.top()-14.0)
+    def _rot_corner_centers(self) -> List[QPointF]:
+        br = super().boundingRect()
+        o = self.ROT_CORNER_OFFSET
+        # Esquinas inferiores para rotación (izq y der)
+        return [
+            QPointF(br.left() - o,  br.bottom() + o),
+            QPointF(br.right() + o, br.bottom() + o),
+        ]
+    def _hit_rot_corner(self, pos: QPointF) -> bool:
+        r = self.ROT_CORNER_R + 3
+        for c in self._rot_corner_centers():
+            if (pos - c).manhattanLength() <= r:
+                return True
+        return False
 
     def boundingRect(self) -> QRectF:
         rect = super().boundingRect(); pad = self.style.outline_width + 4
         if self.isSelected():
             # Aumentar espacio superior para evitar clipping de la palanca de rotación
             extra_top = 50; handle_pad = self.HANDLE_SIZE + 2
-            rect = rect.adjusted(-pad, -pad - extra_top, pad + handle_pad, pad + handle_pad)
+            extra_all = self.ROT_CORNER_OFFSET + self.ROT_CORNER_R + 2
+            rect = rect.adjusted(-pad - extra_all, -pad - extra_top - extra_all,
+                                 pad + handle_pad + extra_all, pad + handle_pad + extra_all)
         else:
             rect = rect.adjusted(-pad, -pad, pad, pad)
         return rect
@@ -946,18 +1064,19 @@ class StrokeTextItem(QGraphicsTextItem):
                 # Resize Handle
                 painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
                 painter.drawRect(self._handle_rect())
-                
-                # Rotation Handle
+
+                # Rotation Handle (superior)
                 c = self._rot_handle_center()
                 top_mid = QPointF((br.left()+br.right())/2.0, br.top())
-                
-                # Line
                 painter.setPen(QPen(border_color, 2))
                 painter.drawLine(top_mid, QPointF(c.x(), c.y() + self.ROT_HANDLE_R))
-                
-                # Circle
                 painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
                 painter.drawEllipse(c, self.ROT_HANDLE_R, self.ROT_HANDLE_R)
+                
+                # Corner rotation handle (square, more visible)
+                painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
+                for corner in self._rot_corner_centers():
+                    painter.drawEllipse(corner, self.ROT_CORNER_R, self.ROT_CORNER_R)
                 
                 # Desired Symbol? (Arrow) - Optional: simple arrow drawing if needed
                 # For now, let's stick to the ball, but make sure it's drawn LAST
@@ -966,16 +1085,10 @@ class StrokeTextItem(QGraphicsTextItem):
     def hoverMoveEvent(self, event):
         if self.locked:
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor)); super().hoverMoveEvent(event); return
-        # Hover logic: show open hand if near rotation handle OR if Alt is pressed
-        if (QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier):
-             self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
-             # If we want to be super detailed, we could change to a refresh/rotate cursor if available, 
-             # but OpenHand is standard for "ready to grab/rotate" in this context or Arrow is fine.
-             # Actually, let's leave it as OpenHand to indicate interaction.
-             super().hoverMoveEvent(event); return
-
         if self._handle_rect().contains(event.pos()):
             self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
+        elif self._hit_rot_corner(event.pos()):
+            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
         else:
             c = self._rot_handle_center()
             if (event.pos() - c).manhattanLength() <= self.ROT_HANDLE_R + 3:
@@ -994,14 +1107,14 @@ class StrokeTextItem(QGraphicsTextItem):
             self._resize_alt_scale = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
             self._start_font_pt = float(self.style.font_point_size); self._start_outline = float(self.style.outline_width)
             event.accept(); return
-        # Rotation on Alt+Drag (anywhere in item) OR Handle Click
-        # Check handle first
+        # Rotation on Alt+Drag (anywhere in item) OR Handle/Corner Click
         handle_clicked = False
         c = self._rot_handle_center()
         if (event.pos() - c).manhattanLength() <= self.ROT_HANDLE_R + 3:
             handle_clicked = True
+        corner_clicked = self._hit_rot_corner(event.pos())
 
-        if handle_clicked or (QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier):
+        if handle_clicked or corner_clicked or (QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier):
             self._rotating = True; self._rot_base = self.rotation()
             center_scene = self.mapToScene(super().boundingRect().center())
             pos_scene = self.mapToScene(event.pos())
@@ -1029,9 +1142,15 @@ class StrokeTextItem(QGraphicsTextItem):
         if self._rotating:
             center_scene = self.mapToScene(super().boundingRect().center())
             pos_scene = self.mapToScene(event.pos())
+            # Evitar sensibilidad extrema cuando el cursor está muy cerca del centro
+            dx = pos_scene.x() - center_scene.x()
+            dy = pos_scene.y() - center_scene.y()
+            if (dx * dx + dy * dy) < (self.ROT_MIN_RADIUS * self.ROT_MIN_RADIUS):
+                return
             cur_angle = math.degrees(math.atan2(
                 pos_scene.y()-center_scene.y(), pos_scene.x()-center_scene.x()))
-            delta = cur_angle - self._rot_start_angle; new = self._rot_base + delta
+            delta = (cur_angle - self._rot_start_angle) * self.ROT_SENSITIVITY
+            new = self._rot_base + delta
             if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
                 new = round(new / 15.0) * 15.0
             self.setRotation(new)
@@ -1082,6 +1201,7 @@ class StrokeTextItem(QGraphicsTextItem):
     def mouseDoubleClickEvent(self, event):
         if not self.locked:
             if self._handle_rect().contains(event.pos()): event.accept(); return
+            if self._hit_rot_corner(event.pos()): event.accept(); return
             c = self._rot_handle_center()
             if (event.pos() - c).manhattanLength() <= self.ROT_HANDLE_R + 3: event.accept(); return
         self._old_text = self.toPlainText()
@@ -2980,10 +3100,10 @@ class MangaTextTool(QMainWindow):
                 if notes:
                     msg.setInformativeText(notes)
                 msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                msg.button(QMessageBox.StandardButton.Yes).setText("Descargar")
+                msg.button(QMessageBox.StandardButton.Yes).setText("Actualizar ahora")
                 msg.button(QMessageBox.StandardButton.No).setText("Luego")
                 if msg.exec() == QMessageBox.StandardButton.Yes:
-                    webbrowser.open(download_url)
+                    _run_self_update(download_url, parent=self)
             else:
                 if show_up_to_date:
                     QMessageBox.information(self, "Actualizaciones", "Ya tienes la ultima version.")
@@ -3598,7 +3718,7 @@ class MangaTextTool(QMainWindow):
         
         try:
             # Run the wizard
-            wizard = WorkflowWizard(self)
+            wizard = WorkflowWizard(self, presets=list(PRESETS.keys()))
             workflow_data = wizard.run()
             
             if not workflow_data:
@@ -3625,6 +3745,8 @@ class MangaTextTool(QMainWindow):
         """Aplica los datos del workflow: crea pestañas y coloca textos automáticamente"""
         from pathlib import Path
         
+        raw_size = self._get_raw_image_size(getattr(workflow_data, "raw_image_path", ""))
+        
         # For each clean image, create a tab and place text boxes
         for clean_image_path in workflow_data.clean_image_paths:
             # Load the clean image
@@ -3648,8 +3770,13 @@ class MangaTextTool(QMainWindow):
             self._apply_wm_to_ctx(ctx)
             
             # Place text boxes according to detections
+            clean_size = pix.size()
+            scale_x, scale_y = 1.0, 1.0
+            if raw_size and raw_size.width() > 0 and raw_size.height() > 0:
+                scale_x = clean_size.width() / raw_size.width()
+                scale_y = clean_size.height() / raw_size.height()
             for detection in workflow_data.detections:
-                self._place_text_from_detection(ctx, detection)
+                self._place_text_from_detection(ctx, detection, scale_x=scale_x, scale_y=scale_y)
             
             # Mark as modified (has unsaved changes)
             self.mark_tab_modified(ctx)
@@ -3665,7 +3792,56 @@ class MangaTextTool(QMainWindow):
                         self.tabs.setCurrentIndex(i)
                         break
     
-    def _place_text_from_detection(self, ctx: 'PageContext', detection: 'TextBoxDetection'):
+    def _get_raw_image_size(self, raw_path: str) -> Optional[QSize]:
+        if not raw_path:
+            return None
+        try:
+            img = QImage(raw_path)
+            if img.isNull():
+                return None
+            return img.size()
+        except Exception:
+            return None
+
+    def _auto_fit_text_item_to_rect(self, item: 'StrokeTextItem', rect: QRectF,
+                                    min_pt: int = 6, max_pt: Optional[int] = None):
+        """Ajusta el tamaño de fuente para que el texto quepa dentro del rect."""
+        text = item.toPlainText().strip()
+        if not text:
+            return
+
+        item.setTextWidth(max(10.0, rect.width()))
+        item._apply_paragraph_to_doc()
+
+        base_pt = max(1, int(item.style.font_point_size))
+        base_outline = int(item.style.outline_width)
+        if max_pt is None:
+            max_pt = max(base_pt, int(rect.height() * 2))
+
+        low, high = min_pt, max_pt
+        best = min_pt
+
+        def _apply_size(pt: int):
+            item.style.font_point_size = int(pt)
+            if base_pt > 0:
+                item.style.outline_width = int(round(base_outline * (pt / base_pt)))
+            item.setFont(item.style.to_qfont())
+            item._apply_paragraph_to_doc()
+
+        while low <= high:
+            mid = (low + high) // 2
+            _apply_size(mid)
+            doc_h = item.document().size().height()
+            if doc_h <= rect.height():
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        _apply_size(best)
+
+    def _place_text_from_detection(self, ctx: 'PageContext', detection: 'TextBoxDetection',
+                                   scale_x: float = 1.0, scale_y: float = 1.0):
         """Coloca una caja de texto en el contexto según una detección"""
         # Get the preset style
         style = PRESETS.get(detection.preset, PRESETS['GLOBO'])
@@ -3676,6 +3852,13 @@ class MangaTextTool(QMainWindow):
         
         # Set position from detection
         rect = detection.get_qrectf()
+        if scale_x != 1.0 or scale_y != 1.0:
+            rect = QRectF(
+                rect.x() * scale_x,
+                rect.y() * scale_y,
+                rect.width() * scale_x,
+                rect.height() * scale_y
+            )
         item.setPos(QPointF(rect.x(), rect.y()))
         
         # Set width from detection
@@ -3688,6 +3871,9 @@ class MangaTextTool(QMainWindow):
         item.setFont(item.style.to_qfont())
         item._apply_paragraph_to_doc()
         item.apply_shadow()
+
+        # Auto-fit font size to the detected box height
+        self._auto_fit_text_item_to_rect(item, rect)
 
     # ---------------- Propiedades ----------------
     def _sync_props_from_item(self, item: StrokeTextItem):
@@ -5815,7 +6001,6 @@ def main():
         sys.exit(0)
     
     # ===== Esta es la primera instancia, continuar normalmente =====
-
     login = LoginDialog()
     if login.exec() != QDialog.DialogCode.Accepted:
         sys.exit(0)

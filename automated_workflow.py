@@ -12,6 +12,7 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 import json
+import re
 
 from PyQt6.QtCore import Qt, QPointF, QRectF, QSize
 from PyQt6.QtGui import (
@@ -83,6 +84,66 @@ class WorkflowData:
             "clean_image_paths": self.clean_image_paths,
             "detections": [d.to_dict() for d in self.detections]
         }
+
+
+# ============================================================================
+# Text Identifier Parsing (for translation input)
+# ============================================================================
+
+_RE_GLOBO = re.compile(r'^\s*(?:Globo\s*\d+|Globo\s*[A-Za-z]+)\s*:\s*(.+)$', re.IGNORECASE)
+_RE_NT = re.compile(r'^\s*N/T\s*:\s*(.+)$', re.IGNORECASE)
+_RE_FUERA = re.compile(r'^\s*\*\s*:\s*(.+)$')
+_RE_PENS_1 = re.compile(r'^\s*\(\)\s*:\s*(.+)$')
+_RE_PENS_2 = re.compile(r'^\s*\((.+)\)\s*$')
+_RE_CUADRO_1 = re.compile(r'^\s*\[\]\s*:\s*(.+)$')
+_RE_CUADRO_2 = re.compile(r'^\s*\[(.+)\]\s*$')
+_RE_TITULO = re.compile(r'^\s*TITULO\s*:\s*(.+)$', re.IGNORECASE)
+_RE_GRITOS = re.compile(r'^\s*GRITOS\s*:\s*(.+)$', re.IGNORECASE)
+_RE_GEMIDOS = re.compile(r'^\s*GEMIDOS\s*:\s*(.+)$', re.IGNORECASE)
+_RE_ONO = re.compile(r'^\s*ONOMATOPEYAS?\s*:\s*(.+)$', re.IGNORECASE)
+_RE_NERV = re.compile(r'^\s*TEXTO[_\s]?NERVIOSO\s*:\s*(.+)$', re.IGNORECASE)
+
+
+def parse_identifier(line: str) -> Tuple[str, str, bool]:
+    """Parse a line that may include an identifier, returning (preset, clean_text, had_identifier)."""
+    s = line.strip()
+    # Recognize parentheses/brackets but keep only inner text
+    m = _RE_PENS_1.match(s)
+    if m:
+        return "PENSAMIENTO", m.group(1).strip(), True
+    m = _RE_PENS_2.match(s)
+    if m:
+        return "PENSAMIENTO", m.group(1).strip(), True
+    m = _RE_CUADRO_1.match(s)
+    if m:
+        return "CUADRO", m.group(1).strip(), True
+    m = _RE_CUADRO_2.match(s)
+    if m:
+        return "CUADRO", m.group(1).strip(), True
+
+    for rx, key in [
+        (_RE_GLOBO, "GLOBO"), (_RE_NT, "N/T"), (_RE_FUERA, "FUERA_GLOBO"),
+        (_RE_TITULO, "TITULO"), (_RE_GRITOS, "GRITOS"), (_RE_GEMIDOS, "GEMIDOS"),
+        (_RE_ONO, "ONOMATOPEYAS"), (_RE_NERV, "TEXTO_NERVIOSO"),
+    ]:
+        m = rx.match(s)
+        if m:
+            return key, m.group(1).strip(), True
+
+    if s.startswith("N/T:"):
+        return "N/T", s[4:].lstrip(), True
+    if s.startswith("Globo X:"):
+        return "GLOBO", s[len("Globo X:"):].lstrip(), True
+    if s.startswith("():"):
+        return "PENSAMIENTO", s[3:].lstrip(), True
+    if s.startswith("[]:"):
+        return "CUADRO", s[3:].lstrip(), True
+    if s.startswith("*:"):
+        return "FUERA_GLOBO", s[2:].lstrip(), True
+    if s.startswith('""'):
+        return "TITULO", s[2:].lstrip(), True
+
+    return "GLOBO", s, False
     
     @staticmethod
     def from_dict(d: Dict) -> 'WorkflowData':
@@ -163,8 +224,8 @@ class DetectionBoxItem(QGraphicsRectItem):
 
 class RawScanDialog(QDialog):
     """Dialog for scanning RAW image and marking text areas"""
-    
-    def __init__(self, parent=None):
+
+    def __init__(self, parent=None, presets: Optional[List[str]] = None):
         super().__init__(parent)
         self.setWindowTitle("Paso 1: Escanear Imagen RAW")
         self.resize(1200, 800)
@@ -177,6 +238,10 @@ class RawScanDialog(QDialog):
         self._draw_start = QPointF()
         self._current_box: Optional[DetectionBoxItem] = None
         
+        self._presets = presets or [
+            "GLOBO", "N/T", "FUERA_GLOBO", "PENSAMIENTO", "CUADRO",
+            "TITULO", "GRITOS", "GEMIDOS", "ONOMATOPEYAS", "TEXTO_NERVIOSO", "ANIDADO"
+        ]
         self._setup_ui()
         
     def _setup_ui(self):
@@ -220,10 +285,7 @@ class RawScanDialog(QDialog):
         preset_group = QGroupBox("Tipo de Texto")
         preset_layout = QFormLayout(preset_group)
         self.preset_combo = QComboBox()
-        self.preset_combo.addItems([
-            "GLOBO", "N/T", "FUERA_GLOBO", "PENSAMIENTO", "CUADRO",
-            "TITULO", "GRITOS", "GEMIDOS", "ONOMATOPEYAS", "TEXTO_NERVIOSO", "ANIDADO"
-        ])
+        self.preset_combo.addItems(self._presets)
         self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
         preset_layout.addRow("Preset:", self.preset_combo)
         controls_layout.addWidget(preset_group)
@@ -611,15 +673,22 @@ class TranslationInputDialog(QDialog):
         lines = [line.strip() for line in self.text_input.toPlainText().splitlines() if line.strip()]
         
         for i, detection in enumerate(self.detections):
-            text = lines[i] if i < len(lines) else ""
-            detection.text = text
+            raw_text = lines[i] if i < len(lines) else ""
+            if raw_text:
+                preset, clean_text, had_id = parse_identifier(raw_text)
+                detection.text = clean_text
+                if had_id:
+                    detection.preset = preset
+            else:
+                detection.text = ""
             
             # Create preview item
-            status = "✅" if text else "⚠️"
-            item_text = f"{status} {detection.id:02d} · {detection.preset} → {text[:50]}{'...' if len(text) > 50 else ''}"
+            status = "✅" if detection.text else "⚠️"
+            preview_text = detection.text
+            item_text = f"{status} {detection.id:02d} · {detection.preset} → {preview_text[:50]}{'...' if len(preview_text) > 50 else ''}"
             
             item = QListWidgetItem(item_text)
-            if not text:
+            if not detection.text:
                 item.setForeground(QColor("#EF4444"))
             
             self.preview_list.addItem(item)
@@ -776,19 +845,20 @@ class CleanImagesDialog(QDialog):
 
 class WorkflowWizard(QDialog):
     """Main wizard that orchestrates the 3-step workflow"""
-    
-    def __init__(self, parent=None):
+
+    def __init__(self, parent=None, presets: Optional[List[str]] = None):
         super().__init__(parent)
         self.setWindowTitle("Workflow Automático de Traducción")
         self.setModal(True)
-        
+
         self.workflow_data = WorkflowData()
+        self._presets = presets
         
     def run(self) -> Optional[WorkflowData]:
         """Run the complete workflow, returns WorkflowData if successful"""
         
         # Step 1: RAW Scan
-        raw_dialog = RawScanDialog(self.parent())
+        raw_dialog = RawScanDialog(self.parent(), presets=self._presets)
         if raw_dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         
