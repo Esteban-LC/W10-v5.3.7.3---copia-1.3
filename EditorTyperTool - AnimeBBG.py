@@ -27,8 +27,6 @@ from pathlib import Path
 import threading
 from queue import Queue
 
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
@@ -108,77 +106,50 @@ def _get_local_version() -> str:
 
 APP_VERSION = _get_local_version()
 
-GSPREAD_CREDS = {
-  "type": "service_account",
-  "project_id": "animebbg-editor",
-  "private_key_id": "3aaf1270a3109c1323cea6b2a28ade84f04b31a1",
-  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCjGyOQe8yFlLW9\nQZi+YMflBtaANrBE9IBo8iu3Z3HfADbjWjvEkP2zpIkobVDVnhdBn48AtPAFGXIe\n0YkTqmo3sxfAjLuQ8ZO8BFgy/99DqH814HrGQUVgznaLwxI6BbuPC78L9ats6SG9\neBuDivm54B3sLz1mNt951AA726ruaRg8fFrCLwUQMSLxnH/PWkoQCx34fT8/zRT7\nxn8fwZC9BCrr0G1tZJRY3JHuuuhTDdcoPs5jYZIycJgWssZBeLOzDYiboZGQkrjz\nsG30ANkgUv1Ef/zkm3AW5b6J5DR922AOYVOBXkBnr/77JgcoG+J2gsSsmENgTArp\n6wNCDMInAgMBAAECggEABnImH6mk1Yqg/A/Bl5R/kd+JTpvar37yLDOV4rOl3mhF\nwwpn3kbUn+rauMxJK4gJ50AFCMQd0DXHOsyRHEPZ2sWrJKLrLrk9W2rYiXtvOV9J\nV7m9YGRn94FxUeitqblcRjTyoehdk/pKqRA8FiDB6cSfqhvb01RL1Ka6M6Nkx/Mz\nJ6onn4FGcH/OLGYSX5HjzDQjMqrGESdfdXCLchYIh3JbsSUUMcd52wiSz3Sdh4o3\netFgB3Ja0umE8T8idoXxNq0Ttp9yDMOq8f0x75rdO92me0m/hu/9L4AOKVFnPIAm\niLLr2bEyb8RC4JGRbo0g1tKhK2nsaGjZs0lfF8UEQQKBgQDSKWyGCj1Xr8uipQGL\nPtI6fWKxFL5U17ZkNvtS3M4LnHRjrj5AJdPm2G3DsBvSUvLGY0ruy6RAMW7l+mBI\nttZtqme29s3k4q7plNSPJm4FNC7HjAmYbeMkcBTva4mkzrrX64YDrLtRcJNIM/ut\n6sngWwvZcfBc6X/qs06xQv4S0QKBgQDGrk/AyUBcWUF00Dz6umoTUdL8hqPCre0d\nz0VA9LhaFWdWnC9mhd40qrHV84756f2CiGCD++1UpXH+idTK3pv5RYFoHE+ONxwt\nsw7hSziZ7dVMwbsbDjF2mXK+xdWpya1gtpR8pOQoACL56IentUJA+baS3EC6Jmnd\nxzV8x+STdwKBgQCD+xm5L9MIL1FeCevnS4Nw0e9Zr+I7m+BiHRlGF36aUh3Rv8o+\nNMNXlJGSNBW0xvzJ0+9p+Z9j5Od1LACtiY0t/7b0cxgoZqdb72hxobu0Luo1zN71\nyAS+jFjJZqphQqaaFMHrqt1ULrN/w42J0goHiIXvf5tobgc0GHkR3zV6EQKBgAmy\nsoPnjvOzC6XnEELw3IKq6NCYxd+X284rsuazy1fiWZP5tbqcaDdL6bhW1jDOwigf\n/g4TOwd5t/HDypZIfXaSdPmfACch+4cjiWNn55Bj8ph3kGmGrNVsMhSr1X0fMg5Z\nezAGYHivYQWv2wdNqrk/NzE9/Q7ZFyvTMIIxw6+LAoGATRjg4DtRQPIk/CHt+ZLY\ngSiAhZytFW1yu5AeEGHBZVC4JTvEmNBnq53/NGXJjohX1wBeDDak7qqk7bhxDqtg\nAz0bpDFHphqz96Ky+78MtuGnX+pyZsQ8DjiaJ64FJTxmUha8HzbijIA7N6xrs+/a\n9nT0GxPPiTDla3l96d1Ip3E=\n-----END PRIVATE KEY-----\n",
-  "client_email": "animebbg-sheets@animebbg-editor.iam.gserviceaccount.com",
-  "client_id": "115397576522399044320",
-  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-  "token_uri": "https://oauth2.googleapis.com/token",
-  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/animebbg-sheets%40animebbg-editor.iam.gserviceaccount.com",
-  "universe_domain": "googleapis.com"
-}
-
-# ---------------- Control de accesos con Google Sheets ----------------
-
-GSCOPE = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-
-# Carpeta donde está este script
-BASE_DIR = Path(__file__).resolve().parent
-
-# Archivo JSON de credenciales (en la misma carpeta que el .py)
-GSPREAD_SHEET_ID = "186A5hhWdp0L2y3bCFsTxOfitSmOD1eFKIBlrj6m4lfk"  # ID del Google Sheet
-
-def get_gspread_client():
-    """Devuelve un cliente gspread autenticado con la cuenta de servicio usando las credenciales en el código."""
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(GSPREAD_CREDS, GSCOPE)
-    return gspread.authorize(creds)
+# ---------------- Control de accesos (Apps Script Web App) ----------------
+# URL del Web App publicado en Apps Script (execute as: Me, acceso: Anyone)
+ACCESS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwi41rSnEl522mfxqcFCco19JFIoz9dlN_nSp8zjphKvpMnVapxC3KitzdYCcmBF2uP-A/exec"
 
 def check_user_exists_and_log(username: str) -> bool:
     """
-    Verifica si 'username' existe en la hoja 'usuarios'.
-    Si existe, registra un log en la hoja 'logs' y devuelve True.
-    Si no existe, devuelve False.
+    Verifica usuario via Apps Script Web App.
+    Si existe, el script registra el log y devuelve ok=True.
     """
     username = username.strip()
     if not username:
         return False
-
-    gc = get_gspread_client()
-    sh = gc.open_by_key(GSPREAD_SHEET_ID)
-
-    # Hoja de usuarios (nombres en columna A)
-    ws_users = sh.worksheet("usuarios")
-    users = ws_users.col_values(1)
-    if username not in users:
+    if not ACCESS_WEBAPP_URL:
         return False
 
-    # Hoja de logs
-    ws_logs = sh.worksheet("logs")
-
-    # Datos del dispositivo
+    # Datos del dispositivo para el log remoto
     hostname = platform.node()
     system_str = platform.platform()
-
-    # IP local (no necesariamente IP pública)
     try:
         ip_local = socket.gethostbyname(socket.gethostname())
     except Exception:
         ip_local = "desconocida"
 
-    # Marca de tiempo (UTC)
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    payload = {
+        "username": username,
+        "ip": ip_local,
+        "host": hostname,
+        "system": system_str,
+    }
 
-    # Se registra: fecha/hora, usuario, ip, hostname, sistema
-    ws_logs.append_row([now, username, ip_local, hostname, system_str])
-
-    return True
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            ACCESS_WEBAPP_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        result = json.loads(raw) if raw else {}
+        return bool(result.get("ok"))
+    except Exception:
+        return False
 
 # ---------------- Iconos ----------------
 def _assets_dir() -> Path:
