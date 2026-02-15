@@ -170,8 +170,15 @@ def _emoji_icon(txt: str, size: int = 24) -> QIcon:
 def icon(name: str) -> QIcon:
     p = ASSETS / 'icons' / name
     if p.exists():
-        ic = QIcon(str(p))
-        if not ic.isNull(): return ic
+        # Para archivos .ico, usar QPixmap como intermediario para mejor compatibilidad
+        if name.endswith('.ico'):
+            pix = QPixmap(str(p))
+            if not pix.isNull():
+                ic = QIcon(pix)
+                if not ic.isNull(): return ic
+        else:
+            ic = QIcon(str(p))
+            if not ic.isNull(): return ic
     std_map = {
         'open.png': QStyle.StandardPixmap.SP_DirOpenIcon,
         'open-proj.png': QStyle.StandardPixmap.SP_DirOpenIcon,
@@ -899,9 +906,13 @@ class StrokeTextItem(QGraphicsTextItem):
         if avg <= 0:
             return []
         hyphen_w = float(fm.horizontalAdvance("-") or 0)
+        # Ancho disponible para texto (considerando el guión)
         usable = max(0.0, max_width - hyphen_w)
-        max_chars = int(usable / avg)
-        max_chars = max(3, max_chars)
+
+        # Umbral: si la palabra ocupa más del 80% del ancho, guionarla
+        # Esto asegura que palabras largas se corten incluso si técnicamente caben
+        threshold = usable * 0.8
+
         positions: List[int] = []
         offset = 0
         for line in text.splitlines(True):
@@ -913,18 +924,37 @@ class StrokeTextItem(QGraphicsTextItem):
                 core = line; line_end = ""
             for m in self._WORD_RX.finditer(core):
                 word = m.group(0)
-                if len(word) <= max_chars + 1:
+                # Calcular el ancho real de la palabra completa
+                word_width = float(fm.horizontalAdvance(word) or 0)
+
+                # Aplicar guiones si:
+                # 1. La palabra NO cabe en el ancho disponible, O
+                # 2. La palabra ocupa más del 80% del ancho (umbral)
+                if word_width <= threshold:
                     continue
+
+                # Calcular cuántos caracteres caben en el ancho disponible
+                chars_fit = 0
+                accumulated_width = 0.0
+                for char in word:
+                    char_width = float(fm.horizontalAdvance(char) or 0)
+                    if accumulated_width + char_width > usable:
+                        break
+                    accumulated_width += char_width
+                    chars_fit += 1
+
+                # Necesitamos al menos 3 caracteres para cortar
+                if chars_fit < 3:
+                    continue
+
                 start = m.start()
-                i = max_chars
+                i = chars_fit
                 while len(word) - i > 2:
                     remaining = len(word) - i
                     if remaining < 3:
                         break
-                    if remaining < 3 and i > 3:
-                        i -= 1
                     positions.append(offset + start + i)
-                    i += max_chars
+                    i += chars_fit
             offset += len(core) + len(line_end)
         return positions
 
@@ -1011,6 +1041,15 @@ class StrokeTextItem(QGraphicsTextItem):
     def _handle_rect(self) -> QRectF:
         br = super().boundingRect(); s = self.HANDLE_SIZE
         return QRectF(br.right()-s, br.bottom()-s, s, s)
+
+    def _handle_hitbox(self) -> QRectF:
+        """Hitbox más grande para facilitar el click en el resize handle"""
+        br = super().boundingRect()
+        s = self.HANDLE_SIZE
+        # Hitbox 3x más grande que el visual
+        hitbox_size = s * 3
+        return QRectF(br.right()-hitbox_size, br.bottom()-hitbox_size, hitbox_size, hitbox_size)
+
     def _rot_handle_center(self) -> QPointF:
         br = super().boundingRect(); return QPointF((br.left()+br.right())/2.0, br.top()-14.0)
     def _rot_corner_centers(self) -> List[QPointF]:
@@ -1086,7 +1125,7 @@ class StrokeTextItem(QGraphicsTextItem):
         try:
             target_fill = qcolor_from_hex(self.style.fill)
             fill_type = getattr(self.style, 'fill_type', 'solid')
-            
+
             if fill_type == 'solid':
                 # For solid, rely on pre-synced defaultTextColor (avoid mutating in paint)
                 super().paint(painter, option, widget)
@@ -1096,13 +1135,13 @@ class StrokeTextItem(QGraphicsTextItem):
                 w = max(1, int(math.ceil(br.width())))
                 h = max(1, int(math.ceil(br.height())))
 
-                # Mask Image (Text in White)
+                    # Mask Image (Text in White)
                 mask_img = QImage(w + pad*2, h + pad*2, QImage.Format.Format_ARGB32_Premultiplied)
                 mask_img.fill(Qt.GlobalColor.transparent)
                 mp = QPainter(mask_img)
                 mp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 mp.translate(pad - br.left(), pad - br.top())
-                
+
                 # Draw Mask without state mutation
                 ctx = QAbstractTextDocumentLayout.PaintContext()
                 ctx.palette.setColor(QPalette.ColorRole.Text, QColor('white'))
@@ -1155,12 +1194,12 @@ class StrokeTextItem(QGraphicsTextItem):
                 rp.end()
 
                 painter.drawImage(QPointF(br.left()-pad, br.top()-pad), result)
-                
+
                 # Draw selection indicators if selected (since super().paint isn't called)
                 if self.isSelected() or (self.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsFocusable and self.hasFocus()):
                      # We can't easily draw the exact cursor/selection overlay of QGraphicsTextItem manually
                      # without super().paint.
-                     # But for gradient text, usually we accept losing the native cursor blink 
+                     # But for gradient text, usually we accept losing the native cursor blink
                      # in exchange for the effect.
                      # However, to support editing, we might want to draw the cursor?
                      # A workaround: Draw standard paint with composition mode?
@@ -1222,7 +1261,7 @@ class StrokeTextItem(QGraphicsTextItem):
     def hoverMoveEvent(self, event):
         if self.locked:
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor)); super().hoverMoveEvent(event); return
-        if self._handle_rect().contains(event.pos()):
+        if self._handle_hitbox().contains(event.pos()):
             self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
         elif self._hit_rot_corner(event.pos()):
             self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
@@ -1238,7 +1277,7 @@ class StrokeTextItem(QGraphicsTextItem):
         if self.locked:
             super().mousePressEvent(event); event.accept(); return
         self._start_pos = self.pos()
-        if self._handle_rect().contains(event.pos()):
+        if self._handle_hitbox().contains(event.pos()):
             self._resizing = True; self._resize_start_width = self.textWidth()
             self._resize_start_pos = event.pos()
             self._resize_alt_scale = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
@@ -1337,7 +1376,7 @@ class StrokeTextItem(QGraphicsTextItem):
 
     def mouseDoubleClickEvent(self, event):
         if not self.locked:
-            if self._handle_rect().contains(event.pos()): event.accept(); return
+            if self._handle_hitbox().contains(event.pos()): event.accept(); return
             if self._hit_rot_corner(event.pos()): event.accept(); return
             c = self._rot_handle_center()
             if (event.pos() - c).manhattanLength() <= self.ROT_HANDLE_R + 3: event.accept(); return
@@ -1436,6 +1475,14 @@ class WatermarkItem(QGraphicsPixmapItem):
         br = super().boundingRect(); s = self.HANDLE_SIZE
         return QRectF(br.right()-s, br.bottom()-s, s, s)
 
+    def _handle_hitbox(self) -> QRectF:
+        """Hitbox más grande para facilitar el click en el resize handle"""
+        br = super().boundingRect()
+        s = self.HANDLE_SIZE
+        # Hitbox 3x más grande que el visual
+        hitbox_size = s * 3
+        return QRectF(br.right()-hitbox_size, br.bottom()-hitbox_size, hitbox_size, hitbox_size)
+
     def paint(self, painter: QPainter, option, widget=None):
         super().paint(painter, option, widget)
         if self.isSelected():
@@ -1445,14 +1492,14 @@ class WatermarkItem(QGraphicsPixmapItem):
             painter.drawRect(self._handle_rect())
 
     def hoverMoveEvent(self, event):
-        if self._handle_rect().contains(event.pos()):
+        if self._handle_hitbox().contains(event.pos()):
             self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
         else:
             self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor if self.isSelected() else Qt.CursorShape.ArrowCursor))
         super().hoverMoveEvent(event)
 
     def mousePressEvent(self, event):
-        if self._handle_rect().contains(event.pos()):
+        if self._handle_hitbox().contains(event.pos()):
             self._resizing = True; event.accept(); return
         super().mousePressEvent(event)
 
@@ -3316,7 +3363,35 @@ class MangaTextTool(QMainWindow):
     def add_tab_for_image(self, path: Path):
         pix = QPixmap(str(path))
         if pix.isNull(): QMessageBox.warning(self, "Error", f"No se pudo cargar: {path}"); return
-        ctx = PageContext(pix, path); idx = self.tabs.addTab(ctx, path.name); self.tabs.setCurrentIndex(idx)
+
+        # Calcular factor de escala basado en el tamaño de la imagen
+        # Imagen base de referencia: 1920x1080 (Full HD)
+        base_width = 1920.0
+        base_height = 1080.0
+        img_width = float(pix.width())
+        img_height = float(pix.height())
+
+        # Calcular factor de escala (promedio de ancho y alto)
+        scale_w = img_width / base_width
+        scale_h = img_height / base_height
+        scale_factor = (scale_w + scale_h) / 2.0
+
+        # Limitar el factor de escala para evitar fuentes demasiado grandes o pequeñas
+        scale_factor = max(0.5, min(scale_factor, 2.0))
+
+        # Aplicar escala a los PRESETS temporalmente
+        global PRESETS
+        original_presets = {k: replace(v) for k, v in PRESETS.items()}
+
+        for key, preset in PRESETS.items():
+            preset.font_point_size = int(round(preset.font_point_size * scale_factor))
+
+        ctx = PageContext(pix, path)
+
+        # Restaurar PRESETS originales
+        PRESETS = original_presets
+
+        idx = self.tabs.addTab(ctx, path.name); self.tabs.setCurrentIndex(idx)
         # Aplica marca de agua si corresponde
         self._apply_wm_to_ctx(ctx)
 
