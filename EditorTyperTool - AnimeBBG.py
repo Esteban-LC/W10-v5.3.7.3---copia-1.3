@@ -1130,23 +1130,35 @@ class StrokeTextItem(QGraphicsTextItem):
         max_shift = (h * 0.55) if vertical else (w * 0.55)
         base_x = float(dst_top_left.x())
         base_y = float(dst_top_left.y())
+        strip = 2  # Dibujar en bandas de 2 px con solape reduce "rallado" por remuestreo.
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         if not vertical:
-            for y in range(h):
-                t = (2.0 * y / max(1, h - 1)) - 1.0
+            for y in range(0, h, strip):
+                y_center = min(h - 1, y + (strip * 0.5))
+                t = (2.0 * y_center / max(1, h - 1)) - 1.0
                 curve, sx = self._warp_row_params(t)
                 dst_w = w * sx
                 dx = (w - dst_w) * 0.5 + (curve * max_shift)
-                dst = QRectF(base_x + dx, base_y + y, dst_w, 1.0)
-                painter.drawImage(dst, src, QRectF(0.0, float(y), float(w), 1.0))
+                src_h = min(strip, h - y)
+                # +0.4 de solape para evitar costuras visibles entre bandas.
+                dst = QRectF(base_x + dx, base_y + y, dst_w, float(src_h) + 0.4)
+                painter.drawImage(dst, src, QRectF(0.0, float(y), float(w), float(src_h)))
         else:
-            for x in range(w):
-                t = (2.0 * x / max(1, w - 1)) - 1.0
+            for x in range(0, w, strip):
+                x_center = min(w - 1, x + (strip * 0.5))
+                t = (2.0 * x_center / max(1, w - 1)) - 1.0
                 curve, sy = self._warp_row_params(t)
                 dst_h = h * sy
                 dy = (h - dst_h) * 0.5 + (curve * max_shift)
-                dst = QRectF(base_x + x, base_y + dy, 1.0, dst_h)
-                painter.drawImage(dst, src, QRectF(float(x), 0.0, 1.0, float(h)))
+                src_w = min(strip, w - x)
+                # +0.4 de solape para evitar costuras visibles entre bandas.
+                dst = QRectF(base_x + x, base_y + dy, float(src_w) + 0.4, dst_h)
+                painter.drawImage(dst, src, QRectF(float(x), 0.0, float(src_w), float(h)))
+
+        painter.restore()
 
     def _render_text_layers_for_warp(self, fill_type: str, ow: int) -> Tuple[QImage, QPointF]:
         br = super().boundingRect()

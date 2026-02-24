@@ -91,6 +91,7 @@ class WorkflowData:
 # ============================================================================
 
 _RE_GLOBO = re.compile(r'^\s*(?:Globo\s*\d+|Globo\s*[A-Za-z]+)\s*:\s*(.+)$', re.IGNORECASE)
+_RE_GNUM = re.compile(r'^\s*G\s*(\d+)\s*:\s*(.+)$', re.IGNORECASE)
 _RE_NT = re.compile(r'^\s*N/T\s*:\s*(.+)$', re.IGNORECASE)
 _RE_FUERA = re.compile(r'^\s*\*\s*:\s*(.+)$')
 _RE_PENS_1 = re.compile(r'^\s*\(\)\s*:\s*(.+)$')
@@ -120,6 +121,11 @@ def parse_identifier(line: str) -> Tuple[str, str, bool]:
     m = _RE_CUADRO_2.match(s)
     if m:
         return "CUADRO", m.group(1).strip(), True
+
+    # G1: / G2: / G3: -> alias de Globo N:
+    m = _RE_GNUM.match(s)
+    if m:
+        return "GLOBO", m.group(2).strip(), True
 
     for rx, key in [
         (_RE_GLOBO, "GLOBO"), (_RE_NT, "N/T"), (_RE_FUERA, "FUERA_GLOBO"),
@@ -586,7 +592,7 @@ class TranslationInputDialog(QDialog):
         # Instructions
         instructions = QLabel(
             "• Pega un texto por línea, en orden numérico (01, 02, 03...)\n"
-            "• Puedes usar identificadores opcionales: 'Globo 1:', 'N/T:', etc.\n"
+            "• Puedes usar identificadores opcionales: 'Globo 1:' o 'G1:', 'N/T:', etc.\n"
             "• El preview muestra cómo se asignarán los textos"
         )
         instructions.setStyleSheet("color: #9ca3af; padding: 5px 10px;")
