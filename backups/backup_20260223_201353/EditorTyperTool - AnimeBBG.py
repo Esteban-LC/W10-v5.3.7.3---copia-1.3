@@ -36,7 +36,7 @@ from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
     QPixmap, QTextCursor, QTextDocument, QTextOption, QShortcut, QKeySequence,
     QUndoStack, QUndoCommand, QTextBlockFormat, QPen, QCursor, QLinearGradient, QBrush,
-    QFontDatabase, QTextCharFormat, QAbstractTextDocumentLayout, QPalette, QFontMetricsF, QTransform, QPainterPath
+    QFontDatabase, QTextCharFormat, QAbstractTextDocumentLayout, QPalette, QFontMetricsF, QTransform
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsDropShadowEffect, QGraphicsItem,
@@ -717,7 +717,7 @@ class TextStyle:
     bold: bool = False
     italic: bool = False
     fill: str = "#000000"
-    # Tipo de relleno: 'solid' | 'linear_gradient' | 'texture' | 'transparent'
+    # Tipo de relleno: 'solid' | 'linear_gradient' | 'texture'
     fill_type: str = 'solid'
     # Para degradado: lista de (pos, color) stops, pos 0.0-1.0
     gradient_stops: List[Tuple[float, str]] = None
@@ -727,12 +727,6 @@ class TextStyle:
     texture_tile: bool = True
     texture_scale: float = 1.0
     texture_angle: int = 0
-    # Deformacion tipo "warp" (Photoshop-like)
-    warp_style: str = "none"      # none | arc | wave | flag | fish
-    warp_vertical: bool = False   # False=horizontal, True=vertical
-    warp_bend: int = 0            # -100..100
-    warp_hdist: int = 0           # -100..100
-    warp_vdist: int = 0           # -100..100
     outline: str = "#FFFFFF"
     outline_width: int = 3
     shadow_enabled: bool = False
@@ -1065,194 +1059,11 @@ class StrokeTextItem(QGraphicsTextItem):
     def sync_default_text_color(self):
         """Mantiene el color de texto en sync sin mutar en paint (evita parpadeo)."""
         try:
-            if getattr(self.style, 'fill_type', 'solid') == 'transparent':
-                target = QColor(0, 0, 0, 0)
-            else:
-                target = qcolor_from_hex(self.style.fill)
+            target = qcolor_from_hex(self.style.fill)
             if self.defaultTextColor() != target:
                 self.setDefaultTextColor(target)
         except Exception:
             pass
-
-    def _warp_row_params(self, t: float) -> Tuple[float, float]:
-        style = str(getattr(self.style, 'warp_style', 'none') or 'none')
-        bend = clamp(float(getattr(self.style, 'warp_bend', 0)) / 100.0, -1.0, 1.0)
-        hdist = clamp(float(getattr(self.style, 'warp_hdist', 0)) / 100.0, -1.0, 1.0)
-        vdist = clamp(float(getattr(self.style, 'warp_vdist', 0)) / 100.0, -1.0, 1.0)
-
-        curve = 0.0
-        sx = 1.0
-        if style == 'arc':
-            # Centrado para evitar que todo el texto se desplace a un solo lado
-            curve = 1.8 * bend * ((1.0 - t * t) - 0.5)
-            sx = 1.0 + hdist * t
-        elif style == 'wave':
-            curve = 1.35 * bend * math.sin((t + 1.0) * math.pi)
-            sx = 1.0 + 0.6 * hdist * math.cos(t * math.pi)
-        elif style == 'flag':
-            curve = 1.5 * bend * math.sin((t + 1.0) * math.pi * 0.5)
-            sx = 1.0 + hdist * math.sin(t * math.pi)
-        elif style == 'fish':
-            curve = 1.3 * bend * t
-            sx = 1.0 + hdist * (1.0 - t * t)
-        else:
-            sx = 1.0 + hdist * t
-        curve += 0.6 * vdist * t
-        sx = clamp(sx, 0.25, 3.0)
-        return curve, sx
-
-    def _warp_extra_bounds(self, base_rect: QRectF) -> Tuple[float, float]:
-        style = str(getattr(self.style, 'warp_style', 'none') or 'none')
-        if style == 'none':
-            return 0.0, 0.0
-        bend = abs(float(getattr(self.style, 'warp_bend', 0)) / 100.0)
-        hdist = abs(float(getattr(self.style, 'warp_hdist', 0)) / 100.0)
-        vdist = abs(float(getattr(self.style, 'warp_vdist', 0)) / 100.0)
-        vertical = bool(getattr(self.style, 'warp_vertical', False))
-
-        if vertical:
-            extra_x = base_rect.width() * (0.10 + 0.25 * hdist + 0.50 * bend + 0.20 * vdist)
-            extra_y = base_rect.height() * (0.10 + 0.15 * hdist + 0.20 * bend + 0.50 * vdist)
-        else:
-            extra_x = base_rect.width() * (0.10 + 0.15 * hdist + 0.20 * bend + 0.50 * vdist)
-            extra_y = base_rect.height() * (0.10 + 0.25 * hdist + 0.50 * bend + 0.20 * vdist)
-        return extra_x, extra_y
-
-    def _draw_warped_image(self, painter: QPainter, src: QImage, dst_top_left: QPointF):
-        w = src.width()
-        h = src.height()
-        if w <= 1 or h <= 1:
-            painter.drawImage(dst_top_left, src)
-            return
-
-        vertical = bool(getattr(self.style, 'warp_vertical', False))
-        # Mayor amplitud para que el efecto se note claramente con valores altos.
-        max_shift = (h * 0.55) if vertical else (w * 0.55)
-        base_x = float(dst_top_left.x())
-        base_y = float(dst_top_left.y())
-
-        if not vertical:
-            for y in range(h):
-                t = (2.0 * y / max(1, h - 1)) - 1.0
-                curve, sx = self._warp_row_params(t)
-                dst_w = w * sx
-                dx = (w - dst_w) * 0.5 + (curve * max_shift)
-                dst = QRectF(base_x + dx, base_y + y, dst_w, 1.0)
-                painter.drawImage(dst, src, QRectF(0.0, float(y), float(w), 1.0))
-        else:
-            for x in range(w):
-                t = (2.0 * x / max(1, w - 1)) - 1.0
-                curve, sy = self._warp_row_params(t)
-                dst_h = h * sy
-                dy = (h - dst_h) * 0.5 + (curve * max_shift)
-                dst = QRectF(base_x + x, base_y + dy, 1.0, dst_h)
-                painter.drawImage(dst, src, QRectF(float(x), 0.0, 1.0, float(h)))
-
-    def _render_text_layers_for_warp(self, fill_type: str, ow: int) -> Tuple[QImage, QPointF]:
-        br = super().boundingRect()
-        pad = max(2, ow + 2)
-        w = max(1, int(math.ceil(br.width())))
-        h = max(1, int(math.ceil(br.height())))
-
-        mask_img = QImage(w + pad*2, h + pad*2, QImage.Format.Format_ARGB32_Premultiplied)
-        mask_img.fill(Qt.GlobalColor.transparent)
-        mp = QPainter(mask_img)
-        mp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        mp.translate(pad - br.left(), pad - br.top())
-        mctx = QAbstractTextDocumentLayout.PaintContext()
-        mctx.palette.setColor(QPalette.ColorRole.Text, QColor('white'))
-        self.document().documentLayout().draw(mp, mctx)
-        mp.end()
-
-        fill_img = QImage(mask_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        fill_img.fill(Qt.GlobalColor.transparent)
-        target_fill = qcolor_from_hex(self.style.fill)
-
-        if fill_type != 'transparent':
-            fp = QPainter(fill_img)
-            fp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            if fill_type == 'solid':
-                fp.fillRect(fill_img.rect(), target_fill)
-            elif fill_type == 'linear_gradient' and self.style.gradient_stops:
-                angle = float(getattr(self.style, 'gradient_angle', 0))
-                rad = math.radians(angle)
-                cx, cy = fill_img.width()/2, fill_img.height()/2
-                dx = math.cos(rad) * cx
-                dy = math.sin(rad) * cy
-                grad = QLinearGradient(QPointF(cx - dx, cy - dy), QPointF(cx + dx, cy + dy))
-                for pos, col in (getattr(self.style, 'gradient_stops', []) or []):
-                    try:
-                        grad.setColorAt(float(pos), qcolor_from_hex(col))
-                    except Exception:
-                        pass
-                fp.fillRect(fill_img.rect(), grad)
-            elif fill_type == 'texture' and getattr(self.style, 'texture_path', ''):
-                tp = getattr(self.style, 'texture_path', '')
-                pm = QPixmap(tp) if tp else QPixmap()
-                if not pm.isNull():
-                    tex_scale = float(getattr(self.style, 'texture_scale', 1.0) or 1.0)
-                    tex_scale = clamp(tex_scale, 0.05, 10.0)
-                    tex_angle = float(getattr(self.style, 'texture_angle', 0))
-                    if getattr(self.style, 'texture_tile', True):
-                        brush = QBrush(pm)
-                        tr = QTransform()
-                        tr.scale(tex_scale, tex_scale)
-                        tr.rotate(tex_angle)
-                        brush.setTransform(tr)
-                        fp.fillRect(fill_img.rect(), brush)
-                    else:
-                        fp.fillRect(fill_img.rect(), target_fill)
-                        fp.save()
-                        fp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-                        cx = fill_img.width() / 2.0
-                        cy = fill_img.height() / 2.0
-                        fit_scale = min(fill_img.width() / max(1, pm.width()), fill_img.height() / max(1, pm.height()))
-                        fp.translate(cx, cy)
-                        fp.rotate(tex_angle)
-                        fp.scale(fit_scale * tex_scale, fit_scale * tex_scale)
-                        fp.translate(-pm.width() / 2.0, -pm.height() / 2.0)
-                        fp.drawPixmap(0, 0, pm)
-                        fp.restore()
-                else:
-                    fp.fillRect(fill_img.rect(), target_fill)
-            else:
-                fp.fillRect(fill_img.rect(), target_fill)
-
-            fp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-            fp.drawImage(0, 0, mask_img)
-            fp.end()
-
-        outline_img = QImage(mask_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        outline_img.fill(Qt.GlobalColor.transparent)
-        if ow > 0:
-            ring = QImage(mask_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
-            ring.fill(Qt.GlobalColor.transparent)
-            rp = QPainter(ring)
-            rp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            max_samples = 11
-            step = 1 if ow <= max_samples else max(1, ow // max_samples)
-            for dx in range(-ow, ow + 1, step):
-                for dy in range(-ow, ow + 1, step):
-                    if dx == 0 and dy == 0:
-                        continue
-                    rp.drawImage(dx, dy, mask_img)
-            rp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
-            rp.drawImage(0, 0, mask_img)
-            rp.end()
-
-            tp = QPainter(outline_img)
-            tp.fillRect(outline_img.rect(), qcolor_from_hex(self.style.outline))
-            tp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-            tp.drawImage(0, 0, ring)
-            tp.end()
-
-        composed = QImage(mask_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        composed.fill(Qt.GlobalColor.transparent)
-        cp = QPainter(composed)
-        cp.drawImage(0, 0, outline_img)
-        cp.drawImage(0, 0, fill_img)
-        cp.end()
-        return composed, QPointF(br.left() - pad, br.top() - pad)
 
     def set_locked(self, v: bool, global_lock: bool = False):
         self.locked = bool(v)
@@ -1312,11 +1123,7 @@ class StrokeTextItem(QGraphicsTextItem):
         return False
 
     def boundingRect(self) -> QRectF:
-        rect = super().boundingRect()
-        pad = self.style.outline_width + 4
-        ex, ey = self._warp_extra_bounds(rect)
-        if ex > 0 or ey > 0:
-            rect = rect.adjusted(-ex, -ey, ex, ey)
+        rect = super().boundingRect(); pad = self.style.outline_width + 4
         if self.isSelected():
             # Aumentar espacio superior para evitar clipping de la palanca de rotación
             extra_top = 50; handle_pad = self.HANDLE_SIZE + 2
@@ -1327,52 +1134,19 @@ class StrokeTextItem(QGraphicsTextItem):
             rect = rect.adjusted(-pad, -pad, pad, pad)
         return rect
 
-    def shape(self):
-        style = str(getattr(self.style, 'warp_style', 'none') or 'none')
-        if style == 'none':
-            return super().shape()
-        # En modo deformado ampliamos hit area para permitir selección/arrastre fiable
-        path = QPainterPath()
-        path.addRect(self.boundingRect())
-        return path
-
     def paint(self, painter: QPainter, option, widget=None):
         # Ocultar el cuadro de selección predeterminado (linea punteada blanca)
         # Esto elimina el ruido visual del boundingRect extendido.
         option.state &= ~QStyle.StateFlag.State_Selected
-        fill_type = getattr(self.style, 'fill_type', 'solid')
-        warp_style = str(getattr(self.style, 'warp_style', 'none') or 'none')
 
-        # En modo edición (doble clic), dibujar normal para ver cursor/selección
-        # y evitar artefactos del render deformado.
-        if self.textInteractionFlags() == Qt.TextInteractionFlag.TextEditorInteraction:
-            try:
-                edit_color = qcolor_from_hex(self.style.outline if fill_type == 'transparent' else self.style.fill)
-                if self.defaultTextColor() != edit_color:
-                    self.setDefaultTextColor(edit_color)
-            except Exception:
-                pass
-            super().paint(painter, option, widget)
-            self._draw_overlays(painter)
-            return
-
-        if fill_type != 'transparent' and self.style.background_enabled and self.style.background_opacity > 0:
+        if self.style.background_enabled and self.style.background_opacity > 0:
             br = super().boundingRect()
             c = QColor(qcolor_from_hex(self.style.background_color))
             c.setAlpha(int(clamp(self.style.background_opacity, 0, 1) * 255))
             painter.fillRect(br, c)
 
         ow = int(max(0, round(float(self.style.outline_width))))
-        if warp_style != 'none':
-            try:
-                composed, pos = self._render_text_layers_for_warp(fill_type, ow)
-                self._draw_warped_image(painter, composed, pos)
-                self._draw_overlays(painter)
-                return
-            except Exception:
-                pass
-
-        if ow > 0 and fill_type != 'transparent':
+        if ow > 0:
             outline_col = qcolor_from_hex(self.style.outline)
             br = super().boundingRect()
             pad = ow
@@ -1405,51 +1179,11 @@ class StrokeTextItem(QGraphicsTextItem):
         # Relleno
         try:
             target_fill = qcolor_from_hex(self.style.fill)
+            fill_type = getattr(self.style, 'fill_type', 'solid')
 
             if fill_type == 'solid':
                 # For solid, rely on pre-synced defaultTextColor (avoid mutating in paint)
                 super().paint(painter, option, widget)
-            elif fill_type == 'transparent':
-                # Texto hueco: genera el contorno en imagen intermedia y recorta el interior.
-                br = super().boundingRect()
-                if ow <= 0:
-                    return
-                pad = ow
-                w = max(1, int(math.ceil(br.width())))
-                h = max(1, int(math.ceil(br.height())))
-                mask_img = QImage(w + pad*2, h + pad*2, QImage.Format.Format_ARGB32_Premultiplied)
-                mask_img.fill(Qt.GlobalColor.transparent)
-                mp = QPainter(mask_img)
-                mp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                mp.translate(pad - br.left(), pad - br.top())
-                mctx = QAbstractTextDocumentLayout.PaintContext()
-                mctx.palette.setColor(QPalette.ColorRole.Text, QColor("white"))
-                self.document().documentLayout().draw(mp, mctx)
-                mp.end()
-
-                ring = QImage(mask_img.size(), QImage.Format.Format_ARGB32_Premultiplied)
-                ring.fill(Qt.GlobalColor.transparent)
-                rp = QPainter(ring)
-                rp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                max_samples = 11
-                step = 1 if ow <= max_samples else max(1, ow // max_samples)
-                for dx in range(-ow, ow + 1, step):
-                    for dy in range(-ow, ow + 1, step):
-                        if dx == 0 and dy == 0:
-                            continue
-                        rp.drawImage(dx, dy, mask_img)
-                rp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
-                rp.drawImage(0, 0, mask_img)
-                rp.end()
-
-                tint = QImage(ring.size(), QImage.Format.Format_ARGB32_Premultiplied)
-                tint.fill(Qt.GlobalColor.transparent)
-                tp = QPainter(tint)
-                tp.fillRect(tint.rect(), qcolor_from_hex(self.style.outline))
-                tp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-                tp.drawImage(0, 0, ring)
-                tp.end()
-                painter.drawImage(QPointF(br.left() - pad, br.top() - pad), tint)
             else:
                 br = super().boundingRect()
                 pad = 2
@@ -1550,9 +1284,6 @@ class StrokeTextItem(QGraphicsTextItem):
             # Fallback
             super().paint(painter, option, widget)
 
-        self._draw_overlays(painter)
-
-    def _draw_overlays(self, painter: QPainter):
         try:
             if getattr(self, 'ordinal', -1) >= 0 and not getattr(self, '_suppress_overlays', False) and self.SHOW_ORDINAL:
                 br = super().boundingRect()
@@ -1575,23 +1306,30 @@ class StrokeTextItem(QGraphicsTextItem):
             br = super().boundingRect(); acc = accent_qcolor()
             painter.setPen(QPen(acc, 1, Qt.PenStyle.DashLine)); painter.drawRect(br)
             if not self.locked:
+                # FORCE VISIBILITY: Larger handle, Distinct Color
                 painter.setOpacity(1.0)
-                handle_color = QColor('#FF4500')
+                handle_color = QColor('#FF4500') # OrangeRed
                 border_color = QColor('white')
-
+                
+                # Resize Handle
                 painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
                 painter.drawRect(self._handle_rect())
 
+                # Rotation Handle (superior)
                 c = self._rot_handle_center()
                 top_mid = QPointF((br.left()+br.right())/2.0, br.top())
                 painter.setPen(QPen(border_color, 2))
                 painter.drawLine(top_mid, QPointF(c.x(), c.y() + self.ROT_HANDLE_R))
                 painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
                 painter.drawEllipse(c, self.ROT_HANDLE_R, self.ROT_HANDLE_R)
-
+                
+                # Corner rotation handle (square, more visible)
                 painter.setPen(QPen(border_color, 2)); painter.setBrush(handle_color)
                 for corner in self._rot_corner_centers():
                     painter.drawEllipse(corner, self.ROT_CORNER_R, self.ROT_CORNER_R)
+                
+                # Desired Symbol? (Arrow) - Optional: simple arrow drawing if needed
+                # For now, let's stick to the ball, but make sure it's drawn LAST
 
 
     def hoverMoveEvent(self, event):
@@ -4312,38 +4050,6 @@ class MangaTextTool(QMainWindow):
         self.hyphen_chk.setToolTip("Inserta guiones suaves para cortar palabras largas sin desbordar")
         self.hyphen_chk.stateChanged.connect(self.on_hyphenate_toggle)
 
-        # Warp / Deformar texto
-        self.warp_style_combo = QComboBox()
-        self.warp_style_combo.addItems(["Ninguno", "Arco", "Onda", "Bandera", "Pez"])
-        self.warp_style_combo.currentIndexChanged.connect(self.on_warp_controls_changed)
-        self.warp_orient_combo = QComboBox()
-        self.warp_orient_combo.addItems(["Horizontal", "Vertical"])
-        self.warp_orient_combo.currentIndexChanged.connect(self.on_warp_controls_changed)
-
-        self.warp_bend_slider = QSlider(Qt.Orientation.Horizontal)
-        self.warp_bend_slider.setRange(-100, 100)
-        self.warp_bend_slider.setValue(0)
-        self.warp_bend_slider.valueChanged.connect(self.on_warp_controls_changed)
-        self.warp_bend_label = QLabel("0")
-        self.warp_bend_label.setObjectName("ValLabel")
-        self.warp_bend_slider.valueChanged.connect(lambda v: self.warp_bend_label.setText(str(v)))
-
-        self.warp_hdist_slider = QSlider(Qt.Orientation.Horizontal)
-        self.warp_hdist_slider.setRange(-100, 100)
-        self.warp_hdist_slider.setValue(0)
-        self.warp_hdist_slider.valueChanged.connect(self.on_warp_controls_changed)
-        self.warp_hdist_label = QLabel("0")
-        self.warp_hdist_label.setObjectName("ValLabel")
-        self.warp_hdist_slider.valueChanged.connect(lambda v: self.warp_hdist_label.setText(str(v)))
-
-        self.warp_vdist_slider = QSlider(Qt.Orientation.Horizontal)
-        self.warp_vdist_slider.setRange(-100, 100)
-        self.warp_vdist_slider.setValue(0)
-        self.warp_vdist_slider.valueChanged.connect(self.on_warp_controls_changed)
-        self.warp_vdist_label = QLabel("0")
-        self.warp_vdist_label.setObjectName("ValLabel")
-        self.warp_vdist_slider.valueChanged.connect(lambda v: self.warp_vdist_label.setText(str(v)))
-
         self.wm_enable_chk = ToggleSwitch()
         self.wm_enable_chk.toggled.connect(self.on_wm_enable_toggled)
 
@@ -4425,30 +4131,6 @@ class MangaTextTool(QMainWindow):
         cl.addLayout(align_row_layout)
         cl.addLayout(_prop_toggle_row("Guionado automatico", self.hyphen_chk))
         main_layout.addWidget(sec_typo)
-
-        sec_warp = PropSection("Deformar", "W")
-        cl = sec_warp.content_layout()
-        cl.addLayout(_prop_row("Estilo", self.warp_style_combo))
-        cl.addLayout(_prop_row("Orientacion", self.warp_orient_combo))
-        wh = QHBoxLayout()
-        wh.addWidget(QLabel("Curvar", styleSheet="color:#9CA3AF;font-size:9px;"))
-        wh.addStretch()
-        wh.addWidget(self.warp_bend_label)
-        cl.addLayout(wh)
-        cl.addLayout(slider_row(self.warp_bend_slider, QLabel()))
-        hh = QHBoxLayout()
-        hh.addWidget(QLabel("Dist. horizontal", styleSheet="color:#9CA3AF;font-size:9px;"))
-        hh.addStretch()
-        hh.addWidget(self.warp_hdist_label)
-        cl.addLayout(hh)
-        cl.addLayout(slider_row(self.warp_hdist_slider, QLabel()))
-        vh = QHBoxLayout()
-        vh.addWidget(QLabel("Dist. vertical", styleSheet="color:#9CA3AF;font-size:9px;"))
-        vh.addStretch()
-        vh.addWidget(self.warp_vdist_label)
-        cl.addLayout(vh)
-        cl.addLayout(slider_row(self.warp_vdist_slider, QLabel()))
-        main_layout.addWidget(sec_warp)
 
         sec_appr = PropSection("Apariencia", "A")
         cl = sec_appr.content_layout()
@@ -4845,9 +4527,7 @@ class MangaTextTool(QMainWindow):
     def _sync_props_from_item(self, item: StrokeTextItem):
         bs = [self.width_spin, self.outw_slider, self.align_combo, self.linespace_slider,
               self.symb_combo, self.no_stroke_chk, self.hyphen_chk,
-              self.shadow_chk, self.bg_chk, self.bg_op, self.cap_combo, self.bold_chk,
-              self.warp_style_combo, self.warp_orient_combo,
-              self.warp_bend_slider, self.warp_hdist_slider, self.warp_vdist_slider]
+              self.shadow_chk, self.bg_chk, self.bg_op, self.cap_combo, self.bold_chk]
         for w in bs: w.blockSignals(True)
 
         # NUEVO: Mostrar advertencia si la fuente original no está disponible (tipo Photoshop)
@@ -4917,20 +4597,6 @@ class MangaTextTool(QMainWindow):
         cap_map_to_idx = {'mixed':0, 'uppercase':1, 'lowercase':2, 'capitalize':3, 'smallcaps':4}
         self.cap_combo.setCurrentIndex(cap_map_to_idx.get(getattr(item.style, 'capitalization', 'mixed'), 0))
 
-        warp_map = {'none': 0, 'arc': 1, 'wave': 2, 'flag': 3, 'fish': 4}
-        ws = str(getattr(item.style, 'warp_style', 'none') or 'none')
-        self.warp_style_combo.setCurrentIndex(warp_map.get(ws, 0))
-        self.warp_orient_combo.setCurrentIndex(1 if bool(getattr(item.style, 'warp_vertical', False)) else 0)
-        wb = int(getattr(item.style, 'warp_bend', 0) or 0)
-        wh = int(getattr(item.style, 'warp_hdist', 0) or 0)
-        wv = int(getattr(item.style, 'warp_vdist', 0) or 0)
-        self.warp_bend_slider.setValue(wb)
-        self.warp_hdist_slider.setValue(wh)
-        self.warp_vdist_slider.setValue(wv)
-        self.warp_bend_label.setText(str(wb))
-        self.warp_hdist_label.setText(str(wh))
-        self.warp_vdist_label.setText(str(wv))
-
         if hasattr(self, '_fill_swatch'):
             self._fill_swatch.set_color(item.style.fill)
         if hasattr(self, '_out_swatch'):
@@ -4989,31 +4655,6 @@ class MangaTextTool(QMainWindow):
         apply_to_selected(ctx, items, "Guionado automático",
                           lambda: [setattr(it.style, 'auto_hyphenate', new) or it._update_soft_hyphens()
                                    for it in items])
-
-    def on_warp_controls_changed(self, *_):
-        items = self._selected_items()
-        ctx = self.current_ctx()
-        if not items or not ctx:
-            return
-        style_keys = ['none', 'arc', 'wave', 'flag', 'fish']
-        style_key = style_keys[self.warp_style_combo.currentIndex()] if 0 <= self.warp_style_combo.currentIndex() < len(style_keys) else 'none'
-        vertical = (self.warp_orient_combo.currentIndex() == 1)
-        bend = int(self.warp_bend_slider.value())
-        hdist = int(self.warp_hdist_slider.value())
-        vdist = int(self.warp_vdist_slider.value())
-
-        def do():
-            for it in items:
-                it.style.warp_style = style_key
-                it.style.warp_vertical = vertical
-                it.style.warp_bend = bend
-                it.style.warp_hdist = hdist
-                it.style.warp_vdist = vdist
-                it.update()
-            if ctx and ctx.scene:
-                ctx.scene.update()
-
-        apply_to_selected(ctx, items, "Deformar texto", do)
 
     def on_rotation_changed(self, deg: float):
         items = self._selected_items(); ctx = self.current_ctx()
@@ -6764,10 +6405,8 @@ class FillChooserDialog(QDialog):
         sl_form = QFormLayout()
         self.solid_btn = QPushButton("Elegir color…")
         self.solid_preview = QLabel(); self.solid_preview.setFixedSize(100, 30); self.solid_preview.setStyleSheet("border: 1px solid #555;")
-        self.solid_transparent_chk = QCheckBox("Relleno transparente (solo trazo)")
         sl_form.addRow("Color:", self.solid_btn)
         sl_form.addRow("Vista:", self.solid_preview)
-        sl_form.addRow("", self.solid_transparent_chk)
         sl.addLayout(sl_form); sl.addStretch()
         self.tabs.addTab(solid_w, "Color Sólido")
 
@@ -6884,7 +6523,6 @@ class FillChooserDialog(QDialog):
         # --- CONNECTIONS ---
         # Solid
         self.solid_btn.clicked.connect(self._pick_solid)
-        self.solid_transparent_chk.stateChanged.connect(self._on_solid_transparent_changed)
         
         # Gradient
         self.grad_bar.stopSelected.connect(self._on_stop_selected_ui)
@@ -6907,7 +6545,6 @@ class FillChooserDialog(QDialog):
 
         # Init state
         self._solid_color = getattr(style, 'fill', '#000000')
-        self._solid_transparent = (getattr(style, 'fill_type', 'solid') == 'transparent')
         self._tex_path = getattr(style, 'texture_path', '')
         self._tex_tile = bool(getattr(style, 'texture_tile', True))
         self._tex_scale = float(getattr(style, 'texture_scale', 1.0) or 1.0)
@@ -6927,9 +6564,6 @@ class FillChooserDialog(QDialog):
         self.tex_scale_spin.blockSignals(False)
         self.tex_rot_slider.blockSignals(False)
         self.tex_rot_spin.blockSignals(False)
-        self.solid_transparent_chk.blockSignals(True)
-        self.solid_transparent_chk.setChecked(self._solid_transparent)
-        self.solid_transparent_chk.blockSignals(False)
         
         # Initial UI sync
         self._update_solid_preview()
@@ -6943,8 +6577,6 @@ class FillChooserDialog(QDialog):
 
     # --- SOLID LOGIC ---
     def _pick_solid(self):
-        if self._solid_transparent:
-            return
         c = qcolor_from_hex(self._solid_color)
         dlg = QColorDialog(c, self)
         dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
@@ -6973,24 +6605,7 @@ class FillChooserDialog(QDialog):
             pass
 
     def _update_solid_preview(self):
-        if self._solid_transparent:
-            self.solid_preview.setText("TRANSP.")
-            self.solid_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.solid_preview.setStyleSheet(
-                "border: 1px solid #777;"
-                "color: #E2E8F0;"
-                "background: repeating-linear-gradient(45deg, #202534, #202534 6px, #141a27 6px, #141a27 12px);"
-            )
-            self.solid_btn.setEnabled(False)
-        else:
-            self.solid_preview.setText("")
-            self.solid_preview.setStyleSheet(f"background-color: {self._solid_color}; border: 1px solid #777;")
-            self.solid_btn.setEnabled(True)
-
-    def _on_solid_transparent_changed(self, state: int):
-        self._solid_transparent = bool(state)
-        self._update_solid_preview()
-        self._notify_update()
+        self.solid_preview.setStyleSheet(f"background-color: {self._solid_color}; border: 1px solid #777;")
 
     # --- GRADIENT LOGIC ---
     def _load_gradient_stops(self, stops):
@@ -7134,10 +6749,7 @@ class FillChooserDialog(QDialog):
     def get_current_spec(self):
         idx = self.tabs.currentIndex()
         if idx == 0:
-            return {
-                'fill_type': 'transparent' if self._solid_transparent else 'solid',
-                'fill': self._solid_color
-            }
+            return {'fill_type': 'solid', 'fill': self._solid_color}
         elif idx == 1:
             return {
                 'fill_type': 'linear_gradient',
