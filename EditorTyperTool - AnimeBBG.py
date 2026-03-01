@@ -332,6 +332,16 @@ def _find_update_payload(extract_dir: Path, exe_name: str) -> Optional[Path]:
 
 def _run_self_update(download_url: str, parent: Optional[QMainWindow] = None) -> None:
     """Descarga la nueva versión y reemplaza la instalación actual mediante un .bat auxiliar."""
+    if not sys.platform.startswith("win"):
+        QMessageBox.information(
+            parent or None,
+            "Actualización",
+            "La actualización automática integrada está disponible en Windows.\n"
+            "Se abrirá la descarga para actualización manual."
+        )
+        webbrowser.open(download_url)
+        return
+
     if not getattr(sys, "frozen", False):
         QMessageBox.information(
             parent or None,
@@ -3812,11 +3822,25 @@ class MangaTextTool(QMainWindow):
                 data = resp.read().decode("utf-8", errors="replace")
             payload = json.loads(data)
             remote_version = str(payload.get("version", "")).strip()
-            download_url = str(payload.get("url", "")).strip()
+            assets = payload.get("assets", {})
+            if isinstance(assets, dict):
+                if sys.platform.startswith("win"):
+                    download_url = str(assets.get("windows", "")).strip()
+                elif sys.platform.startswith("linux"):
+                    download_url = str(assets.get("linux", "")).strip()
+                elif sys.platform == "darwin":
+                    download_url = str(assets.get("macos", "")).strip()
+                else:
+                    download_url = ""
+            else:
+                download_url = ""
+            # Compatibilidad con formato antiguo de version.json
+            if not download_url:
+                download_url = str(payload.get("url", "")).strip()
             notes = str(payload.get("notes", "")).strip()
 
             if not remote_version or not download_url:
-                raise ValueError("version.json incompleto (version/url).")
+                raise ValueError("version.json incompleto (version/url o assets por plataforma).")
 
             if _is_newer_version(remote_version, APP_VERSION):
                 msg = QMessageBox(self)

@@ -1,4 +1,4 @@
-name: build-windows
+name: build-multiplatform
 
 on:
   push:
@@ -9,9 +9,198 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Prepare version.json (platform assets)
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          WINDOWS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+          LINUX_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-linux.tar.gz"
+          MACOS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-macos.pkg"
+          cat > version.json << EOF
+          {
+            "version": "${VERSION}",
+            "notes": "Version ${VERSION}",
+            "url": "${WINDOWS_URL}",
+            "assets": {
+              "windows": "${WINDOWS_URL}",
+              "linux": "${LINUX_URL}",
+              "macos": "${MACOS_URL}"
+            }
+          }
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Windows EXE
+        shell: cmd
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --icon "assets/icons/app.ico" --name "EditorTyperTool-AnimeBBG" --add-data "assets;assets" --add-data "version.json;." "EditorTyperTool - AnimeBBG.py"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/EditorTyperTool-AnimeBBG.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Prepare version.json (platform assets)
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          WINDOWS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+          LINUX_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-linux.tar.gz"
+          MACOS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-macos.pkg"
+          cat > version.json << EOF
+          {
+            "version": "${VERSION}",
+            "notes": "Version ${VERSION}",
+            "url": "${WINDOWS_URL}",
+            "assets": {
+              "windows": "${WINDOWS_URL}",
+              "linux": "${LINUX_URL}",
+              "macos": "${MACOS_URL}"
+            }
+          }
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Linux binary
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name "EditorTyperTool-AnimeBBG" --add-data "assets:assets" --add-data "version.json:." "EditorTyperTool - AnimeBBG.py"
+
+      - name: Pack Linux tar.gz
+        shell: bash
+        run: |
+          chmod +x dist/EditorTyperTool-AnimeBBG
+          tar -czf dist/EditorTyperTool-AnimeBBG-linux.tar.gz -C dist EditorTyperTool-AnimeBBG
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-tar
+          path: dist/EditorTyperTool-AnimeBBG-linux.tar.gz
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Prepare version.json (platform assets)
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          WINDOWS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+          LINUX_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-linux.tar.gz"
+          MACOS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-macos.pkg"
+          cat > version.json << EOF
+          {
+            "version": "${VERSION}",
+            "notes": "Version ${VERSION}",
+            "url": "${WINDOWS_URL}",
+            "assets": {
+              "windows": "${WINDOWS_URL}",
+              "linux": "${LINUX_URL}",
+              "macos": "${MACOS_URL}"
+            }
+          }
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build macOS app bundle
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name "EditorTyperTool-AnimeBBG" --add-data "assets:assets" --add-data "version.json:." "EditorTyperTool - AnimeBBG.py"
+
+      - name: Build PKG installer
+        shell: bash
+        run: |
+          APP_PATH="dist/EditorTyperTool-AnimeBBG.app"
+          PKG_PATH="dist/EditorTyperTool-AnimeBBG-macos.pkg"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "App bundle no encontrado: $APP_PATH"
+            exit 1
+          fi
+          pkgbuild --install-location "/Applications" --component "$APP_PATH" "$PKG_PATH"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-pkg
+          path: dist/EditorTyperTool-AnimeBBG-macos.pkg
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-linux, build-macos]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,54 +211,22 @@ jobs:
         id: version
         shell: bash
         run: |
-          # Extrae la version del tag (v5.3.8 -> 5.3.8)
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected version: $VERSION"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
-
-      - name: Write version.json for this release
-        shell: bash
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          REPO="${{ github.repository }}"
-          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
-
-          cat > version.json << EOF
-          {
-            "version": "${VERSION}",
-            "notes": "Version ${VERSION}",
-            "url": "${DOWNLOAD_URL}"
-          }
-          EOF
-
-          echo "Prepared version.json:"
-          cat version.json
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Build with PyInstaller (single EXE)
-        shell: cmd
-        run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --icon "assets/icons/app.ico" --name "EditorTyperTool-AnimeBBG" --add-data "assets;assets" --add-data "version.json;." "EditorTyperTool - AnimeBBG.py"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: EditorTyperTool-AnimeBBG
-          path: dist/EditorTyperTool-AnimeBBG.exe
+          path: out
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/EditorTyperTool-AnimeBBG.exe
+          files: |
+            out/windows-exe/EditorTyperTool-AnimeBBG.exe
+            out/linux-tar/EditorTyperTool-AnimeBBG-linux.tar.gz
+            out/macos-pkg/EditorTyperTool-AnimeBBG-macos.pkg
           generate_release_notes: true
 
       - name: Commit and push version.json
@@ -77,7 +234,9 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           REPO="${{ github.repository }}"
-          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+          WINDOWS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+          LINUX_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-linux.tar.gz"
+          MACOS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG-macos.pkg"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -90,7 +249,12 @@ jobs:
           {
             "version": "${VERSION}",
             "notes": "Version ${VERSION}",
-            "url": "${DOWNLOAD_URL}"
+            "url": "${WINDOWS_URL}",
+            "assets": {
+              "windows": "${WINDOWS_URL}",
+              "linux": "${LINUX_URL}",
+              "macos": "${MACOS_URL}"
+            }
           }
           EOF
 
