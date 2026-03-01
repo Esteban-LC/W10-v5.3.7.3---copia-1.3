@@ -161,9 +161,33 @@ def _assets_dir() -> Path:
 ASSETS = _assets_dir()
 print(f"[MangaTextTool] ASSETS dir: {ASSETS}")
 
+def _pick_installed_font(candidates: List[str], fallback: str = "Sans Serif") -> str:
+    try:
+        families = set(QFontDatabase.families())
+        for fam in candidates:
+            if fam in families:
+                return fam
+    except Exception:
+        pass
+    return fallback
+
+def _emoji_font_family() -> str:
+    # Selecciona una fuente emoji razonable según plataforma.
+    if sys.platform.startswith("win"):
+        return _pick_installed_font(["Segoe UI Emoji", "Segoe UI Symbol"], fallback="Segoe UI")
+    if sys.platform == "darwin":
+        return _pick_installed_font(["Apple Color Emoji", "Helvetica"], fallback="Helvetica")
+    return _pick_installed_font(["Noto Color Emoji", "Noto Emoji", "DejaVu Sans"], fallback="DejaVu Sans")
+
+def app_icon_asset_name() -> str:
+    # Windows usa .ico; Linux/macOS trabajan mejor con .png para ventana.
+    if sys.platform.startswith("win"):
+        return "app.ico"
+    return "app.png"
+
 def _emoji_icon(txt: str, size: int = 24) -> QIcon:
     pm = QPixmap(size, size); pm.fill(Qt.GlobalColor.transparent)
-    qp = QPainter(pm); f = QFont('Segoe UI Emoji', int(size*0.8)); qp.setFont(f)
+    qp = QPainter(pm); f = QFont(_emoji_font_family(), int(size*0.8)); qp.setFont(f)
     qp.drawText(pm.rect(), int(Qt.AlignmentFlag.AlignCenter), txt); qp.end()
     return QIcon(pm)
 
@@ -203,6 +227,7 @@ def icon(name: str) -> QIcon:
         'panel.png': QStyle.StandardPixmap.SP_ComputerIcon,
         'raw.png': QStyle.StandardPixmap.SP_FileIcon,
         'app.ico': QStyle.StandardPixmap.SP_DesktopIcon,
+        'app.png': QStyle.StandardPixmap.SP_DesktopIcon,
         'sun.png': QStyle.StandardPixmap.SP_DialogOpenButton,
         'moon.png': QStyle.StandardPixmap.SP_DialogCancelButton
     }
@@ -217,7 +242,7 @@ def icon(name: str) -> QIcon:
         'export.png': '📤', 'export-all.png': '📤', 'duplicate.png': '🗐', 'paste.png': '📋',
         'font.png': '🔤', 'lock.png': '🔒', 'pin.png': '📌', 'pin-all.png': '📌',
         'unlock.png': '🔓', 'auto.png': '✨', 'help.png': '❓', 'panel.png': '🧩',
-        'raw.png': '🖼️', 'app.ico': '🅰️', 'sun.png': '☀️', 'moon.png': '🌙'
+        'raw.png': '🖼️', 'app.ico': '🅰️', 'app.png': '🅰️', 'sun.png': '☀️', 'moon.png': '🌙'
     }
     return _emoji_icon(emoji_map.get(name, '❓'))
 
@@ -292,6 +317,58 @@ def qcolor_from_hex(s: str, default: str = "#000000") -> QColor:
     except Exception: return QColor(default)
 
 def clamp(v, a, b): return max(a, min(v, b))
+
+def _normalize_portable_path(p: str) -> str:
+    """Normaliza separadores de ruta para guardado portable en .bbg."""
+    s = str(p or "").strip()
+    if not s:
+        return ""
+    return s.replace("\\", "/")
+
+def _resolve_portable_file_path(saved_path: str, project_dir: Optional[Path] = None, fallback_name: str = "") -> str:
+    """Resuelve una ruta guardada en .bbg entre distintos SO.
+
+    Estrategia:
+    - Probar ruta tal cual y con separadores normalizados.
+    - Si no existe, intentar por nombre de archivo en carpeta del proyecto/assets.
+    """
+    raw = str(saved_path or "").strip().strip('"')
+    if not raw:
+        return ""
+
+    tried: List[Path] = []
+    variants = [raw, raw.replace("\\", "/")]
+    for v in variants:
+        try:
+            p = Path(v)
+            tried.append(p)
+            if p.exists():
+                return str(p)
+        except Exception:
+            pass
+
+    name = str(fallback_name or "").strip()
+    if not name:
+        try:
+            name = Path(raw.replace("\\", "/")).name
+        except Exception:
+            name = ""
+
+    if name:
+        candidate_dirs: List[Path] = []
+        if project_dir is not None:
+            candidate_dirs.extend([project_dir, project_dir / "assets", project_dir / "textures"])
+        candidate_dirs.extend([ASSETS, ASSETS / "textures", ASSETS / "images"])
+        for d in candidate_dirs:
+            try:
+                c = d / name
+                if c.exists():
+                    return str(c)
+            except Exception:
+                pass
+
+    # Devolver normalizada aunque no exista; evita romper apertura del .bbg.
+    return _normalize_portable_path(raw)
 
 # ---- Update helpers ----
 def _parse_version(v: str) -> Tuple[int, ...]:
@@ -466,10 +543,11 @@ def is_font_installed(family_name: str) -> bool:
     return False
 
 def get_safe_font_family(requested_family: str, fallback: str = "Arial") -> str:
-    """Devuelve el nombre de la fuente solicitada si está disponible, sino el fallback."""
-    if is_font_installed(requested_family):
+    """Devuelve fuente segura y multiplataforma."""
+    if requested_family and is_font_installed(requested_family):
         return requested_family
-    return fallback
+    base_candidates = [fallback, "Arial", "DejaVu Sans", "Noto Sans", "Liberation Sans", "Sans Serif"]
+    return _pick_installed_font([c for c in base_candidates if c], fallback="Sans Serif")
 
 def rects_intersect(a: QRectF, b: QRectF) -> bool: return a.intersects(b)
 
@@ -759,7 +837,8 @@ class TextStyle:
     capitalization: str = "mixed"
     def to_qfont(self) -> QFont:
         """Crea QFont desde este estilo."""
-        f = QFont(self.font_family, self.font_point_size); f.setBold(self.bold); f.setItalic(self.italic)
+        fam = get_safe_font_family(self.font_family, fallback="Arial")
+        f = QFont(fam, self.font_point_size); f.setBold(self.bold); f.setItalic(self.italic)
         cap_map = {
             'mixed': QFont.Capitalization.MixedCase,
             'uppercase': QFont.Capitalization.AllUppercase,
@@ -1810,6 +1889,13 @@ class StrokeTextItem(QGraphicsTextItem):
 
 
     def to_dict(self) -> Dict:
+        style_data = asdict(self.style)
+        style_data['texture_path'] = _normalize_portable_path(style_data.get('texture_path', ''))
+        tex_name = ""
+        try:
+            tex_name = Path(style_data.get('texture_path', '')).name if style_data.get('texture_path') else ""
+        except Exception:
+            tex_name = ""
         return {
             'name': self.name,
             'pos': [self.pos().x(), self.pos().y()],
@@ -1817,12 +1903,21 @@ class StrokeTextItem(QGraphicsTextItem):
             'width': self.textWidth(),
             'rotation': self.rotation(),
             'locked': bool(self.locked),
-            'style': asdict(self.style),
+            'style': style_data,
+            'texture_basename': tex_name,
             'ordinal': int(getattr(self, 'ordinal', -1)),
         }
     @staticmethod
-    def from_dict(d: Dict) -> 'StrokeTextItem':
-        st = TextStyle(**d['style'])
+    def from_dict(d: Dict, project_base: Optional[Path] = None) -> 'StrokeTextItem':
+        style_raw = dict(d.get('style', {}))
+        texture_path = style_raw.get('texture_path', '')
+        if texture_path:
+            style_raw['texture_path'] = _resolve_portable_file_path(
+                texture_path,
+                project_dir=project_base,
+                fallback_name=str(d.get('texture_basename', '') or "")
+            )
+        st = TextStyle(**style_raw)
         item = StrokeTextItem(d.get('text', ''), st, name=d.get('name', 'Texto'))
         item.ordinal = int(d.get('ordinal', -1))
         item.setTextWidth(d.get('width', 400))
@@ -3670,7 +3765,7 @@ class MangaTextTool(QMainWindow):
         scale = get_ui_scale_factor()
 
         self.setWindowTitle("EditorTyperTool – Animebbg")
-        self.setWindowIcon(icon('app.ico'))
+        self.setWindowIcon(icon(app_icon_asset_name()))
         _apply_win_icon(self)
         self.resize(scale_size(1400, scale), scale_size(930, scale))
         self.lock_move = False
@@ -4124,7 +4219,7 @@ class MangaTextTool(QMainWindow):
         self.toggle_raw_act.setToolTip("Mostrar/ocultar referencia RAW"); tb.addAction(self.toggle_raw_act)
 
         # Botón Nosotros (ventana emergente)
-        self.about_act = QAction(icon('app.ico'), "", self)
+        self.about_act = QAction(icon(app_icon_asset_name()), "", self)
         self.about_act.setToolTip("Mostrar información de Nosotros")
         self.about_act.triggered.connect(self.show_about_dialog)
         tb.addAction(self.about_act)
@@ -4288,7 +4383,7 @@ class MangaTextTool(QMainWindow):
                 pm = QPixmap(40, 40)
                 pm.fill(Qt.GlobalColor.transparent)
                 p = QPainter(pm)
-                f = QFont("Segoe UI Emoji", 24)
+                f = QFont(_emoji_font_family(), 24)
                 p.setFont(f)
                 p.drawText(pm.rect(), int(Qt.AlignmentFlag.AlignCenter), emoji_map.get(filename, "❓"))
                 p.end()
@@ -5920,7 +6015,7 @@ class MangaTextTool(QMainWindow):
         
         for d in raw.get("items", []):
             try:
-                ctx.add_item_and_list(StrokeTextItem.from_dict(d))
+                ctx.add_item_and_list(StrokeTextItem.from_dict(d, project_base=Path(fname).parent))
             except Exception:
                 pass
 
@@ -7432,7 +7527,7 @@ class FillChooserDialog(QDialog):
 # ---------------- main ----------------
 def main():
     app = QApplication(sys.argv)
-    app.setWindowIcon(icon('app.ico'))
+    app.setWindowIcon(icon(app_icon_asset_name()))
     
     # Calcular y aplicar factor de escala
     scale = get_ui_scale_factor()
