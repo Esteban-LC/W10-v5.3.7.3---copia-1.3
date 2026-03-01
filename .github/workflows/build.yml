@@ -32,42 +32,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Build with PyInstaller (spec)
-        shell: cmd
-        run: |
-          pyinstaller --noconfirm --clean --onedir --windowed --name "EditorTyperTool-AnimeBBG" --add-data "assets;assets" "EditorTyperTool - AnimeBBG.py"
-
-      - name: Zip dist folder
-        shell: powershell
-        run: |
-          if (Test-Path "dist/EditorTyperTool-AnimeBBG.zip") { Remove-Item "dist/EditorTyperTool-AnimeBBG.zip" -Force }
-          Compress-Archive -Path "dist/EditorTyperTool-AnimeBBG/*" -DestinationPath "dist/EditorTyperTool-AnimeBBG.zip"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: EditorTyperTool-AnimeBBG
-          path: dist/EditorTyperTool-AnimeBBG.zip
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/EditorTyperTool-AnimeBBG.zip
-          generate_release_notes: true
-
-      - name: Update version.json with release URL
+      - name: Write version.json for this release
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           REPO="${{ github.repository }}"
-          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.zip"
-          
-          # Actualizar version.json
+          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+
           cat > version.json << EOF
           {
             "version": "${VERSION}",
@@ -75,14 +46,54 @@ jobs:
             "url": "${DOWNLOAD_URL}"
           }
           EOF
-          
-          echo "Updated version.json:"
+
+          echo "Prepared version.json:"
           cat version.json
 
-      - name: Commit and push version.json
+      - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build with PyInstaller (single EXE)
+        shell: cmd
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --icon "assets/icons/app.ico" --name "EditorTyperTool-AnimeBBG" --add-data "assets;assets" --add-data "version.json;." "EditorTyperTool - AnimeBBG.py"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EditorTyperTool-AnimeBBG
+          path: dist/EditorTyperTool-AnimeBBG.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/EditorTyperTool-AnimeBBG.exe
+          generate_release_notes: true
+
+      - name: Commit and push version.json
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/EditorTyperTool-AnimeBBG.exe"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Sincronizar con main para evitar "fetch first" al hacer push.
+          git fetch origin main
+          git checkout -B main origin/main
+
+          cat > version.json << EOF
+          {
+            "version": "${VERSION}",
+            "notes": "Version ${VERSION}",
+            "url": "${DOWNLOAD_URL}"
+          }
+          EOF
+
           git add version.json
-          git commit -m "chore: update version.json to v${{ steps.version.outputs.version }}" || echo "No changes to commit"
-          git push origin HEAD:main
+          git commit -m "chore: update version.json to v${VERSION}" || echo "No changes to commit"
+          git push origin main
