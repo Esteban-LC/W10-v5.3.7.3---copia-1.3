@@ -44,8 +44,8 @@ from PyQt6.QtWidgets import (
     QLabel, QMainWindow, QMessageBox, QPushButton, QSlider, QSpinBox, QToolBar,
     QDockWidget, QListWidget, QListWidgetItem, QFormLayout, QCheckBox, QWidget,
     QVBoxLayout, QDialog, QTextEdit, QDialogButtonBox, QColorDialog, QFontDialog,
-    QTabWidget, QHBoxLayout, QComboBox, QDoubleSpinBox, QGridLayout, QStyleFactory,
-    QToolButton, QStyle, QLineEdit, QFrame, QScrollArea
+    QTabWidget, QTabBar, QHBoxLayout, QComboBox, QDoubleSpinBox, QGridLayout, QStyleFactory,
+    QToolButton, QStyle, QLineEdit, QFrame, QScrollArea, QMenu
 )
 
 # Import automated workflow module
@@ -393,7 +393,7 @@ if not errorlevel 1 (
     timeout /t 1 >nul
     goto waitloop
 )
-robocopy %NEWDIR% %APPDIR% /MIR /NFL /NDL /NJH /NJS /NC /NS >nul
+robocopy %NEWDIR% %APPDIR% /E /NFL /NDL /NJH /NJS /NC /NS >nul
 start "" %EXE%
 del "%~f0"
 endlocal
@@ -928,10 +928,36 @@ class StrokeTextItem(QGraphicsTextItem):
         self._rotating = False; self._rot_start_angle = 0.0; self._rot_base = 0.0
         self._hyphenating = False
         self._raw_text = self._strip_soft_hyphens(text)
+        # Un pequeño margen interno evita recortes en fuentes manuscritas/itálicas.
+        try:
+            self.document().setDocumentMargin(2.0)
+        except Exception:
+            pass
         # Aplicar fuente (Sin cambiar a fallback automático — solo detectar para advertencia)
         self.setFont(style.to_qfont()); self._apply_paragraph_to_doc()
         self.setTextWidth(400); self.apply_shadow(); self.background_enabled = style.background_enabled
         self._update_soft_hyphens()
+
+    def _outline_offsets(self, ow: int) -> List[Tuple[int, int]]:
+        """Offsets en disco para contorno más redondo (evita aspecto cuadrado)."""
+        ow = int(max(0, ow))
+        if ow <= 0:
+            return []
+        if ow <= 12:
+            step = 1
+        elif ow <= 24:
+            step = 2
+        else:
+            step = 3
+        r2 = ow * ow
+        offsets: List[Tuple[int, int]] = []
+        for dx in range(-ow, ow + 1, step):
+            for dy in range(-ow, ow + 1, step):
+                if dx == 0 and dy == 0:
+                    continue
+                if (dx * dx + dy * dy) <= (r2 + ow):
+                    offsets.append((dx, dy))
+        return offsets
 
     def _strip_soft_hyphens(self, text: str) -> str:
         return (text or "").replace(self.SOFT_HYPHEN, "")
@@ -1162,7 +1188,7 @@ class StrokeTextItem(QGraphicsTextItem):
 
     def _render_text_layers_for_warp(self, fill_type: str, ow: int) -> Tuple[QImage, QPointF]:
         br = super().boundingRect()
-        pad = max(2, ow + 2)
+        pad = max(4, ow + 4)
         w = max(1, int(math.ceil(br.width())))
         h = max(1, int(math.ceil(br.height())))
 
@@ -1170,6 +1196,7 @@ class StrokeTextItem(QGraphicsTextItem):
         mask_img.fill(Qt.GlobalColor.transparent)
         mp = QPainter(mask_img)
         mp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        mp.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         mp.translate(pad - br.left(), pad - br.top())
         mctx = QAbstractTextDocumentLayout.PaintContext()
         mctx.palette.setColor(QPalette.ColorRole.Text, QColor('white'))
@@ -1241,13 +1268,9 @@ class StrokeTextItem(QGraphicsTextItem):
             ring.fill(Qt.GlobalColor.transparent)
             rp = QPainter(ring)
             rp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            max_samples = 11
-            step = 1 if ow <= max_samples else max(1, ow // max_samples)
-            for dx in range(-ow, ow + 1, step):
-                for dy in range(-ow, ow + 1, step):
-                    if dx == 0 and dy == 0:
-                        continue
-                    rp.drawImage(dx, dy, mask_img)
+            rp.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            for dx, dy in self._outline_offsets(ow):
+                rp.drawImage(dx, dy, mask_img)
             rp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
             rp.drawImage(0, 0, mask_img)
             rp.end()
@@ -1325,7 +1348,7 @@ class StrokeTextItem(QGraphicsTextItem):
 
     def boundingRect(self) -> QRectF:
         rect = super().boundingRect()
-        pad = self.style.outline_width + 4
+        pad = int(math.ceil(float(self.style.outline_width))) + 6
         ex, ey = self._warp_extra_bounds(rect)
         if ex > 0 or ey > 0:
             rect = rect.adjusted(-ex, -ey, ex, ey)
@@ -1354,6 +1377,9 @@ class StrokeTextItem(QGraphicsTextItem):
         option.state &= ~QStyle.StateFlag.State_Selected
         fill_type = getattr(self.style, 'fill_type', 'solid')
         warp_style = str(getattr(self.style, 'warp_style', 'none') or 'none')
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         # En modo edición (doble clic), dibujar normal para ver cursor/selección
         # y evitar artefactos del render deformado.
@@ -1387,7 +1413,7 @@ class StrokeTextItem(QGraphicsTextItem):
         if ow > 0 and fill_type != 'transparent':
             outline_col = qcolor_from_hex(self.style.outline)
             br = super().boundingRect()
-            pad = ow
+            pad = ow + 3
             img_w = max(1, int(math.ceil(br.width())) + pad * 2)
             img_h = max(1, int(math.ceil(br.height())) + pad * 2)
             img = QImage(img_w, img_h, QImage.Format.Format_ARGB32_Premultiplied)
@@ -1395,6 +1421,8 @@ class StrokeTextItem(QGraphicsTextItem):
 
             img_p = QPainter(img)
             img_p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            img_p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            img_p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             img_p.translate(pad - br.left(), pad - br.top())
             
             # Use PaintContext to draw with outline color without modifying item state
@@ -1405,14 +1433,10 @@ class StrokeTextItem(QGraphicsTextItem):
             img_p.end()
 
             # Dibujar la imagen muestreada
-            max_samples = 11
-            step = 1 if ow <= max_samples else max(1, ow // max_samples)
             base_x = br.left() - pad
             base_y = br.top() - pad
-            for dx in range(-ow, ow + 1, step):
-                for dy in range(-ow, ow + 1, step):
-                    if dx == 0 and dy == 0: continue
-                    painter.drawImage(QPointF(base_x + dx, base_y + dy), img)
+            for dx, dy in self._outline_offsets(ow):
+                painter.drawImage(QPointF(base_x + dx, base_y + dy), img)
 
         # Relleno
         try:
@@ -1443,13 +1467,9 @@ class StrokeTextItem(QGraphicsTextItem):
                 ring.fill(Qt.GlobalColor.transparent)
                 rp = QPainter(ring)
                 rp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                max_samples = 11
-                step = 1 if ow <= max_samples else max(1, ow // max_samples)
-                for dx in range(-ow, ow + 1, step):
-                    for dy in range(-ow, ow + 1, step):
-                        if dx == 0 and dy == 0:
-                            continue
-                        rp.drawImage(dx, dy, mask_img)
+                rp.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+                for dx, dy in self._outline_offsets(ow):
+                    rp.drawImage(dx, dy, mask_img)
                 rp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
                 rp.drawImage(0, 0, mask_img)
                 rp.end()
@@ -2361,7 +2381,14 @@ class PageContext(QWidget):
 
     def on_layer_selected(self, cur: QListWidgetItem, prev: QListWidgetItem):
         item = self.current_item()
-        if not item: return
+        if not item:
+            try:
+                win = self.window()
+                if hasattr(win, "_update_font_button_state"):
+                    win._update_font_button_state([])
+            except Exception:
+                pass
+            return
         for i in range(self.layer_list.count()):
             itw = self.layer_list.item(i); obj: StrokeTextItem = itw.data(Qt.ItemDataRole.UserRole)
             obj.setSelected(obj is item)
@@ -2372,7 +2399,14 @@ class PageContext(QWidget):
 
     def on_scene_selection_changed(self):
         sel = self.scene.selectedItems()
-        if not sel: return
+        if not sel:
+            try:
+                win = self.window()
+                if hasattr(win, "_update_font_button_state"):
+                    win._update_font_button_state([])
+            except Exception:
+                pass
+            return
         item = sel[0]
         for i in range(self.layer_list.count()):
             it = self.layer_list.item(i)
@@ -3580,7 +3614,10 @@ class PropSection(QWidget):
         header.mousePressEvent = self._toggle
 
     def _toggle(self, _event):
-        self._collapsed = not self._collapsed
+        self.set_collapsed(not self._collapsed)
+
+    def set_collapsed(self, collapsed: bool):
+        self._collapsed = bool(collapsed)
         self._content.setVisible(not self._collapsed)
         self._arrow.setText(">" if self._collapsed else "v")
 
@@ -3660,8 +3697,22 @@ class MangaTextTool(QMainWindow):
         # Ruta del último proyecto guardado (para auto-guardar)
         self.last_saved_project_path = None
 
-        self.tabs = QTabWidget(); self.tabs.setTabsClosable(True); self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs = QTabWidget(); self.tabs.setTabsClosable(False)
         self.setCentralWidget(self.tabs)
+        self.tabs.tabBar().currentChanged.connect(lambda _i: self._refresh_tab_close_buttons())
+        self.tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabs.tabBar().customContextMenuRequested.connect(self._show_tab_context_menu)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setStyleSheet(
+            "QTabBar::scroller { width: 74px; background:#111827; border:1px solid #1F2937; border-radius:6px; margin-left:2px; }"
+            "QTabBar QToolButton {"
+            "background:transparent; color:#94A3B8; border:none;"
+            "min-width:28px; max-width:30px; min-height:22px; max-height:22px; margin:0; padding:0 2px; font-size:16px; font-weight:500;"
+            "}"
+            "QTabBar QToolButton:hover { background:#1F2937; color:#E2E8F0; }"
+            "QTabBar QToolButton:pressed { background:#263042; }"
+            "QTabBar QToolButton:disabled { color:#475569; background:transparent; }"
+        )
 
         self._dark_theme = True
 
@@ -3673,6 +3724,7 @@ class MangaTextTool(QMainWindow):
         self._build_right_panel()
         self._build_raw_dock()
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        QShortcut(QKeySequence("Ctrl+F4"), self, activated=self.close_current_tab)
 
         # Atajos
         QShortcut(QKeySequence('T'), self, activated=self.add_text_paste_dialog)
@@ -3690,6 +3742,7 @@ class MangaTextTool(QMainWindow):
         QShortcut(QKeySequence("Shift+Down"),  self, activated=lambda: self.nudge_selected(dy=+1, step=10))
 
         self.statusBar().showMessage("Listo")
+        self._refresh_tab_close_buttons()
 
         # Sincroniza estado inicial de controles de marca de agua
         try:
@@ -3877,6 +3930,7 @@ class MangaTextTool(QMainWindow):
         PRESETS = original_presets
 
         idx = self.tabs.addTab(ctx, path.name); self.tabs.setCurrentIndex(idx)
+        self._refresh_tab_close_buttons()
         # Aplica marca de agua si corresponde
         self._apply_wm_to_ctx(ctx)
 
@@ -3923,7 +3977,58 @@ class MangaTextTool(QMainWindow):
         
         # Proceder a cerrar
         self.tabs.removeTab(idx)
+        self._refresh_tab_close_buttons()
         ctx.deleteLater()
+
+    def close_current_tab(self):
+        idx = self.tabs.currentIndex()
+        if idx >= 0:
+            self.close_tab(idx)
+
+    def _show_tab_context_menu(self, pos):
+        try:
+            bar = self.tabs.tabBar()
+            idx = bar.tabAt(pos)
+            if idx < 0:
+                return
+            menu = QMenu(bar)
+            act_close = menu.addAction("Cerrar pestaña")
+            act = menu.exec(bar.mapToGlobal(pos))
+            if act == act_close:
+                self.close_tab(idx)
+        except Exception:
+            pass
+
+    def _refresh_tab_close_buttons(self):
+        """Sin botones de cierre embebidos para evitar cierres accidentales."""
+        self._enhance_tab_nav_buttons()
+
+    def _enhance_tab_nav_buttons(self):
+        """Hace visibles/claros los botones de navegar pestañas y menú de pestañas."""
+        try:
+            bar = self.tabs.tabBar()
+            for btn in bar.findChildren(QToolButton):
+                arrow = btn.arrowType()
+                if arrow == Qt.ArrowType.LeftArrow:
+                    btn.setArrowType(Qt.ArrowType.NoArrow)
+                    btn.setText("‹")
+                    btn.setToolTip("Pestañas anteriores")
+                    btn.setAutoRaise(True)
+                    btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                elif arrow == Qt.ArrowType.RightArrow:
+                    btn.setArrowType(Qt.ArrowType.NoArrow)
+                    btn.setText("›")
+                    btn.setToolTip("Pestañas siguientes")
+                    btn.setAutoRaise(True)
+                    btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                elif arrow == Qt.ArrowType.DownArrow:
+                    btn.setArrowType(Qt.ArrowType.NoArrow)
+                    btn.setText("⋯")
+                    btn.setToolTip("Más pestañas")
+                    btn.setAutoRaise(True)
+                    btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        except Exception:
+            pass
 
     # ---------- UI ----------
     def add_act(self, tb: QToolBar, icon_name: str, tip: str, slot: Callable,
@@ -3976,6 +4081,7 @@ class MangaTextTool(QMainWindow):
         lock_sel    = self.add_act(tb, 'pin.png', "Fijar seleccionados • Ctrl+L", self.lock_selected_items, "Ctrl+L")
         lock_all    = self.add_act(tb, 'pin-all.png', "Fijar TODOS en pestaña • Ctrl+Shift+L", self.lock_all_items_current_tab, "Ctrl+Shift+L")
         unlock_sel  = self.add_act(tb, 'unlock.png', "Desbloquear seleccionados • Ctrl+U", self.unlock_selected_items_confirm, "Ctrl+U")
+        close_tab_act = self.add_act(tb, 'trash.png', "Cerrar pestaña actual • Ctrl+F4", self.close_current_tab, "Ctrl+F4")
 
         info = self.add_act(tb, 'help.png', "Ayuda: atajos y consejos", lambda: QMessageBox.information(self, "Ayuda",
             "Workflow Automático (Ctrl+W) → automatiza RAW → Traducción → Imágenes Limpias → Colocación de textos.\n"
@@ -4023,6 +4129,39 @@ class MangaTextTool(QMainWindow):
         #          QSize(25, 25) -> QSize(20, 20) para iconos más pequeños
         tb.setIconSize(QSize(25, 25))
         self.toggle_raw_act.toggled.connect(lambda vis: self.raw_dock.setVisible(vis))
+        self._setup_toolbar_extension_button(tb)
+
+    def _setup_toolbar_extension_button(self, tb: QToolBar):
+        """Estilo del botón de desbordamiento del toolbar (cuando faltan espacio)."""
+        tb.setStyleSheet(
+            "QToolButton#qt_toolbar_ext_button {"
+            "background:#182132; color:#E2E8F0; border:1px solid #334155; border-radius:8px;"
+            "padding:2px 10px; min-width:72px; min-height:22px; font-weight:700;"
+            "}"
+            "QToolButton#qt_toolbar_ext_button:hover { background:#24324A; color:#FFFFFF; border-color:#5B6B86; }"
+            "QToolButton#qt_toolbar_ext_button:pressed { background:#2C3E5A; }"
+        )
+
+        def _wire_ext_btn():
+            try:
+                ext = tb.findChild(QToolButton, "qt_toolbar_ext_button")
+                if not ext:
+                    return
+                ext.setToolTip("Mas opciones del toolbar")
+                ext.setText("Opciones")
+                ext.setAutoRaise(False)
+                ext.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+                ext.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            except Exception:
+                pass
+
+        # Qt crea este botón dinámicamente; lo refrescamos al inicio y en resize.
+        QTimer.singleShot(0, _wire_ext_btn)
+        orig_resize = tb.resizeEvent
+        def _resize_hook(event):
+            orig_resize(event)
+            QTimer.singleShot(0, _wire_ext_btn)
+        tb.resizeEvent = _resize_hook
 
     def show_about_dialog(self):
         dlg = QDialog(self)
@@ -4231,9 +4370,14 @@ class MangaTextTool(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         root_vbox.addWidget(scroll, 1)
 
+        screen = QGuiApplication.primaryScreen()
+        geom = screen.availableGeometry() if screen else None
+        screen_h = geom.height() if geom else 768
+        compact_laptop = screen_h <= 900
+
         main_layout = QVBoxLayout(self.prop_content_widget)
-        main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.setSpacing(3)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(2 if compact_laptop else 3)
 
         self.symb_combo = QComboBox()
         self.symb_combo.addItems(list(PRESETS.keys()))
@@ -4258,6 +4402,8 @@ class MangaTextTool(QMainWindow):
 
         self.font_btn = QPushButton("Fuente")
         self.font_btn.setObjectName("PropBtn")
+        self.font_btn.setEnabled(False)
+        self.font_btn.setToolTip("Selecciona una caja de texto para ver/cambiar su fuente")
         self.font_btn.clicked.connect(self.choose_font)
 
         self.fill_btn = QPushButton()
@@ -4277,12 +4423,20 @@ class MangaTextTool(QMainWindow):
 
         self.outw_slider = QSlider(Qt.Orientation.Horizontal)
         self.outw_slider.setRange(0, 40)
+        self.outw_slider.setSingleStep(1)
+        self.outw_slider.setPageStep(1)
+        self.outw_slider.setTickInterval(1)
         self.outw_slider.setValue(3)
         self.outw_slider.valueChanged.connect(self.on_outline_width)
+        self.outw_slider.valueChanged.connect(self._on_outline_slider_ui_changed)
         self.outw_label = QLabel("3")
         self.outw_label.setObjectName("ValLabel")
         self.outw_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.outw_slider.valueChanged.connect(lambda v: self.outw_label.setText(str(v)))
+        self.outw_spin = QSpinBox()
+        self.outw_spin.setRange(0, 40)
+        self.outw_spin.setFixedWidth(52)
+        self.outw_spin.setValue(3)
+        self.outw_spin.valueChanged.connect(lambda v: self.outw_slider.setValue(v))
 
         self.shadow_chk = ToggleSwitch()
         self.shadow_chk.stateChanged.connect(self.on_shadow_toggle)
@@ -4460,6 +4614,7 @@ class MangaTextTool(QMainWindow):
         vh.addWidget(self.warp_vdist_label)
         cl.addLayout(vh)
         cl.addLayout(slider_row(self.warp_vdist_slider, QLabel()))
+        sec_warp.set_collapsed(True)
         main_layout.addWidget(sec_warp)
 
         sec_appr = PropSection("Apariencia", "A")
@@ -4468,6 +4623,7 @@ class MangaTextTool(QMainWindow):
         gsr_hdr = QHBoxLayout()
         gsr_hdr.addWidget(QLabel("Grosor trazo", styleSheet="color:#9CA3AF;font-size:9px;"))
         gsr_hdr.addStretch()
+        gsr_hdr.addWidget(self.outw_spin)
         gsr_hdr.addWidget(self.outw_label)
         cl.addLayout(gsr_hdr)
         cl.addLayout(slider_row(self.outw_slider, QLabel()))
@@ -4483,7 +4639,12 @@ class MangaTextTool(QMainWindow):
         op_hdr.addWidget(self._bg_op_label)
         cl.addLayout(op_hdr)
         cl.addLayout(slider_row(self.bg_op, QLabel()))
-        cl.addLayout(_prop_toggle_row("Usar marca de agua", self.wm_enable_chk))
+        sec_bg.set_collapsed(True)
+        main_layout.addWidget(sec_bg)
+
+        sec_wm = PropSection("Marca de agua", "M")
+        cl = sec_wm.content_layout()
+        cl.addLayout(_prop_toggle_row("Usar marca", self.wm_enable_chk))
         cl.addLayout(_prop_row("Imagen", self.wm_pick_btn))
         wm_hdr = QHBoxLayout()
         wm_hdr.addWidget(QLabel("Opacidad marca", styleSheet="color:#9CA3AF;font-size:9px;"))
@@ -4491,12 +4652,26 @@ class MangaTextTool(QMainWindow):
         wm_hdr.addWidget(self._wm_op_label)
         cl.addLayout(wm_hdr)
         cl.addLayout(slider_row(self.wm_op_slider, QLabel()))
-        main_layout.addWidget(sec_bg)
+        # Oculta esta sección al inicio porque es una opción secundaria.
+        sec_wm.set_collapsed(True)
+        main_layout.addWidget(sec_wm)
+
+        if compact_laptop:
+            # En pantallas bajas, iniciar secciones secundarias colapsadas
+            sec_bg.set_collapsed(True)
 
         main_layout.addStretch()
         self.prop_panel.setMaximumWidth(16777215)
         self.prop_dock.setWidget(self.prop_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.prop_dock)
+        # Ancho fijo y consistente para evitar diferencias visuales por resolución/DPI.
+        target_width = 260
+        self.prop_dock.setMinimumWidth(220)
+        self.prop_dock.setMaximumWidth(300)
+        QTimer.singleShot(
+            0,
+            lambda: self.resizeDocks([self.prop_dock], [target_width], Qt.Orientation.Horizontal)
+        )
         try:
             self.prop_dock.visibilityChanged.connect(self._on_prop_visibility_changed)
             for tb in self.findChildren(QToolBar):
@@ -4740,6 +4915,7 @@ class MangaTextTool(QMainWindow):
             # Create a new tab
             ctx = PageContext(pix, Path(clean_image_path))
             idx = self.tabs.addTab(ctx, Path(clean_image_path).name)
+            self._refresh_tab_close_buttons()
             
             # Store workflow data in context for persistence
             ctx.workflow_data = workflow_data.to_dict()
@@ -4855,11 +5031,14 @@ class MangaTextTool(QMainWindow):
 
     # ---------------- Propiedades ----------------
     def _sync_props_from_item(self, item: StrokeTextItem):
+        self._update_font_button_state(self._selected_items())
         bs = [self.width_spin, self.outw_slider, self.align_combo, self.linespace_slider,
               self.symb_combo, self.no_stroke_chk, self.hyphen_chk,
               self.shadow_chk, self.bg_chk, self.bg_op, self.cap_combo, self.bold_chk,
               self.warp_style_combo, self.warp_orient_combo,
               self.warp_bend_slider, self.warp_hdist_slider, self.warp_vdist_slider]
+        if hasattr(self, 'outw_spin'):
+            bs.append(self.outw_spin)
         for w in bs: w.blockSignals(True)
 
         # NUEVO: Mostrar advertencia si la fuente original no está disponible (tipo Photoshop)
@@ -4900,6 +5079,8 @@ class MangaTextTool(QMainWindow):
         outw_value = item.style.outline_width
         self.outw_slider.setValue(outw_value)
         self.outw_label.setText(str(outw_value))
+        if hasattr(self, 'outw_spin'):
+            self.outw_spin.setValue(int(outw_value))
         
         self.no_stroke_chk.setChecked(item.style.outline_width == 0); self._apply_no_stroke_enabled_state()
 
@@ -4957,15 +5138,48 @@ class MangaTextTool(QMainWindow):
         no_stroke = self.no_stroke_chk.isChecked()
         self.outw_slider.setEnabled(not no_stroke)
         self.outw_label.setEnabled(not no_stroke)
+        if hasattr(self, 'outw_spin'):
+            self.outw_spin.setEnabled(not no_stroke)
         self.out_btn.setEnabled(not no_stroke)
         if hasattr(self, '_out_swatch'):
             self._out_swatch.setEnabled(not no_stroke)
+
+    def _on_outline_slider_ui_changed(self, v: int):
+        self.outw_label.setText(str(int(v)))
+        if hasattr(self, 'outw_spin'):
+            self.outw_spin.blockSignals(True)
+            self.outw_spin.setValue(int(v))
+            self.outw_spin.blockSignals(False)
 
     def _apply_bg_controls_state(self):
         enabled = self.bg_chk.isChecked()
         self.bg_btn.setEnabled(enabled); self.bg_op.setEnabled(enabled)
         if hasattr(self, '_bg_swatch'):
             self._bg_swatch.setEnabled(enabled)
+
+    def _update_font_button_state(self, selected_items: Optional[List[StrokeTextItem]] = None):
+        """Sincroniza el botón de fuente con la selección actual."""
+        if not hasattr(self, "font_btn"):
+            return
+        items = selected_items if selected_items is not None else self._selected_items()
+
+        if not items:
+            self.font_btn.setText("Fuente")
+            self.font_btn.setToolTip("Selecciona una caja de texto para ver/cambiar su fuente")
+            self.font_btn.setEnabled(False)
+            return
+
+        if len(items) > 1:
+            self.font_btn.setText("Fuentes (seleccion multiple)")
+            self.font_btn.setToolTip("Seleccion multiple detectada. Cambia la fuente una caja a la vez.")
+            self.font_btn.setEnabled(False)
+            return
+
+        family = str(getattr(items[0].style, 'font_family', '') or "Fuente")
+        short_name = family if len(family) <= 28 else (family[:25] + "...")
+        self.font_btn.setText(short_name)
+        self.font_btn.setToolTip(f"Fuente actual: {family}\nClic para cambiar.")
+        self.font_btn.setEnabled(True)
 
     def on_symbol_changed(self, _idx: int):
         items = self._selected_items()
@@ -5087,18 +5301,27 @@ class MangaTextTool(QMainWindow):
         ctx = self.current_ctx()
         if not ctx: return
         items = self._selected_items()
-        if not items: return
-        base = items[0].style.to_qfont()
+        if not items:
+            self._update_font_button_state(items)
+            return
+        if len(items) != 1:
+            self._update_font_button_state(items)
+            QMessageBox.information(self, "Fuente", "Selecciona una sola caja de texto para cambiar la fuente.")
+            return
+        item = items[0]
+        base = item.style.to_qfont()
         font, ok = QFontDialog.getFont(base, self, "Elegir fuente")
         if not ok: return
         new_family, new_pt, new_bold, new_italic = font.family(), font.pointSize(), font.bold(), font.italic()
-        apply_to_selected(ctx, items, "Cambiar fuente (varias)", lambda: [
-            setattr(it.style, 'font_family', new_family) or setattr(it.style, 'font_point_size', new_pt) or
-            setattr(it.style, 'bold', new_bold) or setattr(it.style, 'italic', new_italic) or
-            it.setFont(it.style.to_qfont()) or it._apply_paragraph_to_doc()
-            for it in items
+        apply_to_selected(ctx, [item], "Cambiar fuente", lambda: [
+            setattr(item.style, 'font_family', new_family),
+            setattr(item.style, 'font_point_size', new_pt),
+            setattr(item.style, 'bold', new_bold),
+            setattr(item.style, 'italic', new_italic),
+            item.setFont(item.style.to_qfont()),
+            item._apply_paragraph_to_doc()
         ])
-        self._sync_props_from_item(items[0])
+        self._sync_props_from_item(item)
 
     def _get_current_qcolor(self, which: str, item: StrokeTextItem) -> QColor:
         return {'fill': qcolor_from_hex(item.style.fill, "#000000"),
@@ -5231,6 +5454,10 @@ class MangaTextTool(QMainWindow):
             self.outw_slider.setValue(item.style.outline_width)
             self.outw_label.setText(str(item.style.outline_width))
             self.outw_slider.blockSignals(False)
+            if hasattr(self, 'outw_spin'):
+                self.outw_spin.blockSignals(True)
+                self.outw_spin.setValue(int(item.style.outline_width))
+                self.outw_spin.blockSignals(False)
         apply_to_selected(ctx, [item], "Sin trazo", do)
         self._apply_no_stroke_enabled_state()
 
@@ -5528,6 +5755,13 @@ class MangaTextTool(QMainWindow):
             pix = self._raw_per_tab.get(ctx); self._set_raw_pixmap(pix)
             # aplica marca de agua al cambiar de pestaña
             self._apply_wm_to_ctx(ctx)
+            ci = self.current_item()
+            if ci:
+                self._sync_props_from_item(ci)
+            else:
+                self._update_font_button_state([])
+        else:
+            self._update_font_button_state([])
 
     def _set_raw_pixmap(self, pix: Optional[QPixmap]):
         if pix is None or pix.isNull():
@@ -5668,6 +5902,7 @@ class MangaTextTool(QMainWindow):
 
         idx = self.tabs.addTab(ctx, Path(fname).name)
         self.tabs.setCurrentIndex(idx)
+        self._refresh_tab_close_buttons()
         self.statusBar().showMessage(f"Proyecto cargado: {Path(fname).name}")
         
         # Guardar la ruta del proyecto para auto-guardar
@@ -5778,6 +6013,7 @@ class MangaTextTool(QMainWindow):
         
         idx = self.tabs.addTab(ctx, f"{Path(fname).stem} (PSD)")
         self.tabs.setCurrentIndex(idx)
+        self._refresh_tab_close_buttons()
         num_images = len(image_layers)
         self.statusBar().showMessage(f"PSD cargado: {Path(fname).name} - {num_images} imagen(es) + {len(text_layers)} texto(s)")
         

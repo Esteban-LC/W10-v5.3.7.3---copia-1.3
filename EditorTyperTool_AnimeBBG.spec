@@ -9,7 +9,7 @@ a = Analysis(
     ['EditorTyperTool - AnimeBBG.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets', 'assets')],
+    datas=[('assets', 'assets'), ('version.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
