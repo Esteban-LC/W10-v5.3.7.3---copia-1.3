@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QDockWidget, QListWidget, QListWidgetItem, QFormLayout, QCheckBox, QWidget,
     QVBoxLayout, QDialog, QTextEdit, QDialogButtonBox, QColorDialog, QFontDialog,
     QTabWidget, QTabBar, QHBoxLayout, QComboBox, QDoubleSpinBox, QGridLayout, QStyleFactory,
-    QToolButton, QStyle, QLineEdit, QFrame, QScrollArea, QMenu
+    QToolButton, QStyle, QLineEdit, QFrame, QScrollArea, QMenu, QSizePolicy
 )
 
 # Import automated workflow module
@@ -4785,7 +4785,9 @@ class MangaTextTool(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.prop_dock)
         # Ancho fijo y consistente para evitar diferencias visuales por resolución/DPI.
         target_width = 260
-        self.prop_dock.setMinimumWidth(220)
+        self._prop_expanded_width = target_width
+        self._prop_collapsed_width = 32
+        self.prop_dock.setMinimumWidth(180)
         self.prop_dock.setMaximumWidth(300)
         QTimer.singleShot(
             0,
@@ -4827,19 +4829,31 @@ class MangaTextTool(QMainWindow):
     def toggle_prop_panel(self, checked: bool):
         """Colapsa/expande el panel de propiedades al estilo Photoshop."""
         if checked:
-            # Colapsado: solo la tirita con el botón
+            # Colapsado: solo la tirita con el boton
+            current_w = self.prop_dock.width()
+            if current_w > (self._prop_collapsed_width + 12):
+                self._prop_expanded_width = current_w
             self.prop_content_widget.hide()
-            # Ancho reducido, casi solo el botón
-            self.prop_panel.setMaximumWidth(self.prop_toggle_btn.width() + 8)
-            # Flecha hacia la izquierda ◀ (indica que se puede expandir)
+            # Ancho reducido, casi solo el boton, incluyendo el dock.
+            collapsed_w = max(self._prop_collapsed_width, self.prop_toggle_btn.width() + 8)
+            self.prop_panel.setMinimumWidth(collapsed_w)
+            self.prop_panel.setMaximumWidth(collapsed_w)
+            self.prop_dock.setMinimumWidth(collapsed_w)
+            self.prop_dock.setMaximumWidth(collapsed_w)
+            self.resizeDocks([self.prop_dock], [collapsed_w], Qt.Orientation.Horizontal)
+            # Flecha hacia la izquierda (indica que se puede expandir)
             self.prop_toggle_btn.setArrowType(Qt.ArrowType.LeftArrow)
         else:
             # Expandido: se ve el contenido completo
             self.prop_content_widget.show()
+            self.prop_panel.setMinimumWidth(0)
             self.prop_panel.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
-            # Flecha hacia la derecha ▶ (indica que se puede colapsar)
+            self.prop_dock.setMinimumWidth(180)
+            self.prop_dock.setMaximumWidth(300)
+            target_w = max(180, min(300, int(getattr(self, "_prop_expanded_width", 260))))
+            self.resizeDocks([self.prop_dock], [target_w], Qt.Orientation.Horizontal)
+            # Flecha hacia la derecha (indica que se puede colapsar)
             self.prop_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
-
     # ---------------- Acciones principales ----------------
     def open_images(self):
         filter_str = "Todos los archivos soportados (*.png *.jpg *.jpeg *.webp *.bbg"
@@ -5838,12 +5852,45 @@ class MangaTextTool(QMainWindow):
                                   QDockWidget.DockWidgetFeature.DockWidgetClosable |
                                   QDockWidget.DockWidgetFeature.DockWidgetFloatable)
 
-        host = QWidget(self.raw_dock); v = QVBoxLayout(host); btns = QHBoxLayout()
-        self.btn_load_raw = QPushButton("Cargar imagen RAW…", host); self.btn_load_raw.clicked.connect(self.load_raw_image)
-        self.btn_clear_raw = QPushButton("Borrar referencia", host); self.btn_clear_raw.clicked.connect(self.clear_raw_image)
-        btns.addWidget(self.btn_load_raw); btns.addWidget(self.btn_clear_raw); v.addLayout(btns)
+        self.raw_panel = QWidget(self.raw_dock)
+        raw_root = QVBoxLayout(self.raw_panel)
+        raw_root.setContentsMargins(0, 0, 0, 0)
+        raw_root.setSpacing(0)
 
-        self.raw_view = RawView(host); v.addWidget(self.raw_view); host.setLayout(v); self.raw_dock.setWidget(host)
+        self.raw_toggle_btn = QToolButton(self.raw_panel)
+        self.raw_toggle_btn.setCheckable(True)
+        self.raw_toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.raw_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
+        self.raw_toggle_btn.setFixedWidth(24)
+        self.raw_toggle_btn.toggled.connect(self.toggle_raw_panel)
+        raw_root.addWidget(self.raw_toggle_btn, 0)
+
+        self.raw_content_widget = QWidget(self.raw_panel)
+        v = QVBoxLayout(self.raw_content_widget)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(6)
+        btns = QHBoxLayout()
+        self.btn_load_raw = QPushButton("Cargar imagen RAW…", self.raw_content_widget)
+        self.btn_load_raw.clicked.connect(self.load_raw_image)
+        self.btn_clear_raw = QPushButton("Borrar referencia", self.raw_content_widget)
+        self.btn_clear_raw.clicked.connect(self.clear_raw_image)
+        self.btn_load_raw.setMinimumWidth(0)
+        self.btn_clear_raw.setMinimumWidth(0)
+        self.btn_load_raw.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.btn_clear_raw.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        btns.addWidget(self.btn_load_raw)
+        btns.addWidget(self.btn_clear_raw)
+        v.addLayout(btns)
+
+        self.raw_view = RawView(self.raw_content_widget)
+        self.raw_view.setMinimumWidth(0)
+        v.addWidget(self.raw_view, 1)
+        raw_root.addWidget(self.raw_content_widget, 1)
+        self.raw_dock.setWidget(self.raw_panel)
+        self._raw_expanded_width = 260
+        self._raw_collapsed_width = 32
+        self.raw_dock.setMinimumWidth(120)
+        self.raw_dock.setMaximumWidth(500)
 
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.raw_dock)
         try:
@@ -5857,6 +5904,30 @@ class MangaTextTool(QMainWindow):
             tb.addAction(self.toggle_raw_act); break
 
         self._raw_per_tab: Dict['PageContext', Optional[QPixmap]] = {}
+
+    def toggle_raw_panel(self, checked: bool):
+        """Colapsa/expande el panel RAW al estilo Photoshop."""
+        if checked:
+            current_w = self.raw_dock.width()
+            if current_w > (self._raw_collapsed_width + 12):
+                self._raw_expanded_width = current_w
+            self.raw_content_widget.hide()
+            collapsed_w = max(self._raw_collapsed_width, self.raw_toggle_btn.width() + 8)
+            self.raw_panel.setMinimumWidth(collapsed_w)
+            self.raw_panel.setMaximumWidth(collapsed_w)
+            self.raw_dock.setMinimumWidth(collapsed_w)
+            self.raw_dock.setMaximumWidth(collapsed_w)
+            self.resizeDocks([self.raw_dock], [collapsed_w], Qt.Orientation.Horizontal)
+            self.raw_toggle_btn.setArrowType(Qt.ArrowType.LeftArrow)
+        else:
+            self.raw_content_widget.show()
+            self.raw_panel.setMinimumWidth(0)
+            self.raw_panel.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+            self.raw_dock.setMinimumWidth(120)
+            self.raw_dock.setMaximumWidth(500)
+            target_w = max(120, min(500, int(getattr(self, "_raw_expanded_width", 260))))
+            self.resizeDocks([self.raw_dock], [target_w], Qt.Orientation.Horizontal)
+            self.raw_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
 
     def _on_raw_visibility_changed(self, visible: bool):
         """Sincroniza la acción del toolbar con el dock RAW,
@@ -7599,3 +7670,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
