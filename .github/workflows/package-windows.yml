@@ -1,0 +1,38 @@
+name: package-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build EXE (PyInstaller spec)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean "EditorTyperTool_AnimeBBG.spec"
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EditorTyperTool-AnimeBBG-windows
+          path: dist/EditorTyperTool-AnimeBBG.exe
+          if-no-files-found: error
