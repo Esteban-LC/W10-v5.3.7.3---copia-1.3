@@ -7035,46 +7035,135 @@ class MangaTextTool(QMainWindow):
 
 # ---------------- Widgets de soporte para el Gestor de Estilos ----------------
 
+# Caché para no re-escanear la misma fuente de símbolos repetidamente
+_preview_text_cache: Dict[str, str] = {}
+
+
 class StylePreviewWidget(QWidget):
-    """Widget que muestra una vista previa del estilo de texto."""
+    """Widget que muestra una vista previa del estilo de texto.
+    Detecta automáticamente fuentes de símbolos/iconos y muestra sus glifos reales.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(200, 80)
         self.setMaximumHeight(100)
         self._style: Optional[TextStyle] = None
-        self._text = "Ejemplo Abc"
-    
+        self._text = "EJEMPLO ABC"
+        self._display_text = "EJEMPLO ABC"
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_preview_text(family: str, default_text: str) -> str:
+        """Devuelve texto de muestra adecuado para la fuente.
+        Para fuentes de símbolos/iconos escanea rangos Unicode y retorna
+        los primeros glifos disponibles en lugar de letras latinas vacías.
+        Compatible con PyQt5 y PyQt6.
+        """
+        if family in _preview_text_cache:
+            return _preview_text_cache[family]
+
+        # La constante Latin cambió entre PyQt5 y PyQt6
+        try:
+            latin_const = QFontDatabase.WritingSystem.Latin   # PyQt6
+        except AttributeError:
+            latin_const = QFontDatabase.Latin                  # PyQt5
+
+        # writingSystems es estático en PyQt6; en PyQt5 también funciona así.
+        # REGLA: solo es fuente de símbolos si systems es NO-vacío Y Latin no está.
+        # Si devuelve vacío significa que QFontDatabase no encontró la familia
+        # exacta (p.ej. "CCAstroCityIntBoldItalic") → asumir Latin por defecto.
+        try:
+            systems = set(QFontDatabase.writingSystems(family))
+            is_symbol_font = len(systems) > 0 and latin_const not in systems
+        except Exception:
+            is_symbol_font = False
+
+        if not is_symbol_font:
+            _preview_text_cache[family] = default_text
+            return default_text
+
+        # Fuente de símbolos/iconos: buscar caracteres con glifos reales
+        test_font = QFont(family, 14)
+        fm = QFontMetricsF(test_font)
+        chars: list[str] = []
+
+        def _has_glyph(ch: str) -> bool:
+            """Comprueba si la fuente tiene glifo para ch (PyQt5 y PyQt6)."""
+            try:
+                return bool(fm.inFont(ch))            # PyQt5
+            except AttributeError:
+                # PyQt6: inFont fue eliminado; usamos advance > 0 y no es espacio
+                return fm.horizontalAdvance(ch) > 0 and not ch.isspace()
+
+        # Rangos ordenados por probabilidad de contener glifos útiles
+        ranges = [
+            (0x0021, 0x007E),   # ASCII imprimible
+            (0xF000, 0xF0FF),   # Área privada (Wingdings, Webdings, icon fonts)
+            (0xE000, 0xE0FF),   # Área privada extendida
+            (0x2600, 0x26FF),   # Símbolos misceláneos
+            (0x2700, 0x27BF),   # Dingbats
+            (0x2190, 0x21FF),   # Flechas
+            (0x2200, 0x22FF),   # Operadores matemáticos
+            (0x00A1, 0x024F),   # Latin extendido / caracteres especiales
+            (0x2013, 0x204A),   # Puntuación general
+        ]
+        for start, end in ranges:
+            for cp in range(start, end + 1):
+                ch = chr(cp)
+                try:
+                    if _has_glyph(ch):
+                        chars.append(ch)
+                except Exception:
+                    pass
+                if len(chars) >= 10:
+                    break
+            if len(chars) >= 10:
+                break
+
+        result = "  ".join(chars[:10]) if chars else "■  ▲  ●  ★  ◆"
+        _preview_text_cache[family] = result
+        return result
+
+    # ------------------------------------------------------------------
     def set_style(self, style: TextStyle):
         self._style = style
+        self._display_text = self._resolve_preview_text(style.font_family, self._text)
         self.update()
-    
+
     def set_preview_text(self, text: str):
-        self._text = text or "Ejemplo Abc"
+        self._text = text or "EJEMPLO ABC"
+        if self._style:
+            self._display_text = self._resolve_preview_text(
+                self._style.font_family, self._text
+            )
         self.update()
-    
+
+    # ------------------------------------------------------------------
     def paintEvent(self, event):
         if not self._style:
             return
-        
+
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Fondo
         p.fillRect(self.rect(), QColor("#1a1a2e"))
-        
-        # Configurar fuente
-        font = self._style.to_qfont()
+
+        # Configurar fuente – QFont directo para mostrar la fuente real sin fallback a Arial
+        font = QFont(self._style.font_family)
         preview_size = min(self._style.font_point_size, 28)
         font.setPointSize(preview_size)
+        font.setBold(self._style.bold)
+        font.setItalic(self._style.italic)
         p.setFont(font)
-        
-        text = self._text
+
+        text = self._display_text
         fm = p.fontMetrics()
         text_rect = fm.boundingRect(text)
-        
+
         x = (self.width() - text_rect.width()) // 2
         y = (self.height() + fm.ascent() - fm.descent()) // 2
-        
+
         # Dibujar outline si existe
         if self._style.outline_width > 0:
             outline_color = QColor(self._style.outline)
@@ -7084,11 +7173,11 @@ class StylePreviewWidget(QWidget):
                 for dy in [-1, 0, 1]:
                     if dx != 0 or dy != 0:
                         p.drawText(x + dx, y + dy, text)
-        
+
         # Dibujar texto principal
         p.setPen(QColor(self._style.fill))
         p.drawText(x, y, text)
-        
+
         p.end()
 
 
@@ -7204,7 +7293,7 @@ class StyleEditorWidget(QWidget):
         self._building = True
         self._style = style
         
-        self.font_label.setText(style.font_family)
+        self._set_font_label(style.font_family)
         self.size_spin.setValue(style.font_point_size)
         self.bold_chk.setChecked(style.bold)
         self.italic_chk.setChecked(style.italic)
@@ -7259,22 +7348,69 @@ class StyleEditorWidget(QWidget):
         
         self.styleChanged.emit()
     
+    def _set_font_label(self, family: str):
+        """Muestra el nombre de la fuente renderizado en la propia fuente seleccionada."""
+        self.font_label.setText(family)
+        self.font_label.setStyleSheet(
+            f"font-family: '{family}'; font-size: 10pt; color: #ccc;"
+        )
+
     def _pick_font(self):
         if not self._style:
             return
         cur = self._style.to_qfont()
-        font, ok = QFontDialog.getFont(cur, self, "Elegir fuente")
-        if ok:
-            self._style.font_family = font.family()
+
+        # Guardar valores originales para revertir si se cancela
+        orig_family = self._style.font_family
+        orig_pt     = self._style.font_point_size
+        orig_bold   = self._style.bold
+        orig_italic = self._style.italic
+
+        dlg = QFontDialog(cur, self)
+        dlg.setWindowTitle("Elegir fuente")
+
+        def _live(font: QFont):
+            self._style.font_family     = font.family()
             self._style.font_point_size = font.pointSize()
-            self._style.bold = font.bold()
-            self._style.italic = font.italic()
-            self.font_label.setText(font.family())
+            self._style.bold            = font.bold()
+            self._style.italic          = font.italic()
+            self._set_font_label(font.family())
+            self._building = True
             self.size_spin.setValue(font.pointSize())
             self.bold_chk.setChecked(font.bold())
             self.italic_chk.setChecked(font.italic())
+            self._building = False
             self.styleChanged.emit()
-    
+
+        dlg.currentFontChanged.connect(_live)
+
+        if dlg.exec():
+            font = dlg.selectedFont()
+            self._style.font_family     = font.family()
+            self._style.font_point_size = font.pointSize()
+            self._style.bold            = font.bold()
+            self._style.italic          = font.italic()
+            self._set_font_label(font.family())
+            self._building = True
+            self.size_spin.setValue(font.pointSize())
+            self.bold_chk.setChecked(font.bold())
+            self.italic_chk.setChecked(font.italic())
+            self._building = False
+            self.styleChanged.emit()
+        else:
+            # Cancelado: revertir al estado original
+            self._style.font_family     = orig_family
+            self._style.font_point_size = orig_pt
+            self._style.bold            = orig_bold
+            self._style.italic          = orig_italic
+            self._set_font_label(orig_family)
+            self._building = True
+            self.size_spin.setValue(orig_pt)
+            self.bold_chk.setChecked(orig_bold)
+            self.italic_chk.setChecked(orig_italic)
+            self._building = False
+            self.styleChanged.emit()
+
     def _pick_fill_color(self):
         if not self._style:
             return
