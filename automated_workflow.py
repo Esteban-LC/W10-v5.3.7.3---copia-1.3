@@ -16,15 +16,16 @@ import re
 
 from PyQt6.QtCore import Qt, QPointF, QRectF, QSize
 from PyQt6.QtGui import (
-    QColor, QPainter, QPen, QBrush, QPixmap, QImage, 
-    QFont, QCursor, QKeySequence, QShortcut
+    QColor, QPainter, QPen, QBrush, QPixmap, QImage,
+    QFont, QCursor, QKeySequence, QShortcut,
+    QStandardItemModel, QStandardItem, QAction
 )
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QGraphicsScene, QGraphicsView,
     QGraphicsRectItem, QGraphicsTextItem, QFileDialog, QMessageBox,
     QTextEdit, QComboBox, QFormLayout, QWidget, QSplitter,
-    QGroupBox, QScrollArea, QFrame, QStackedWidget, QProgressBar
+    QGroupBox, QScrollArea, QFrame, QStackedWidget, QProgressBar, QMenu
 )
 
 # ============================================================================
@@ -150,7 +151,36 @@ def parse_identifier(line: str) -> Tuple[str, str, bool]:
         return "TITULO", s[2:].lstrip(), True
 
     return "GLOBO", s, False
-    
+
+
+def parse_identifier_extended(
+    line: str, custom_presets: Optional[List[str]] = None
+) -> Tuple[str, str, bool]:
+    """Extended version of parse_identifier that also recognises custom preset names as prefixes.
+
+    Tries standard identifier patterns first (G1:, N/T:, [], etc.).
+    If none matched, checks if the line starts with any custom preset name followed by ':'.
+    Matching is case-insensitive so "cuadros chicos: texto" finds preset "Cuadros Chicos".
+
+    Returns (preset_name, clean_text, had_identifier).
+    """
+    preset, text, found = parse_identifier(line)
+    if found:
+        return preset, text, found
+
+    # Try custom preset names as "PresetName: text"
+    if custom_presets:
+        s = line.strip()
+        for preset_name in custom_presets:
+            prefix = preset_name + ":"
+            if s.lower().startswith(prefix.lower()):
+                clean = s[len(prefix):].lstrip()
+                if clean:
+                    return preset_name, clean, True
+
+    return preset, text, False
+
+
     @staticmethod
     def from_dict(d: Dict) -> 'WorkflowData':
         return WorkflowData(
@@ -231,11 +261,13 @@ class DetectionBoxItem(QGraphicsRectItem):
 class RawScanDialog(QDialog):
     """Dialog for scanning RAW image and marking text areas"""
 
-    def __init__(self, parent=None, presets: Optional[List[str]] = None):
+    def __init__(self, parent=None, presets: Optional[List[str]] = None,
+                 folders: Optional[List[Dict]] = None,
+                 folder_map: Optional[Dict[str, str]] = None):
         super().__init__(parent)
         self.setWindowTitle("Paso 1: Escanear Imagen RAW")
         self.resize(1200, 800)
-        
+
         self.raw_image_path: Optional[str] = None
         self.raw_pixmap: Optional[QPixmap] = None
         self.detections: List[TextBoxDetection] = []
@@ -243,11 +275,13 @@ class RawScanDialog(QDialog):
         self._drawing = False
         self._draw_start = QPointF()
         self._current_box: Optional[DetectionBoxItem] = None
-        
+
         self._presets = presets or [
             "GLOBO", "N/T", "FUERA_GLOBO", "PENSAMIENTO", "CUADRO",
             "TITULO", "GRITOS", "GEMIDOS", "ONOMATOPEYAS", "TEXTO_NERVIOSO", "ANIDADO"
         ]
+        self._folders: List[Dict] = folders or []
+        self._folder_map: Dict[str, str] = folder_map or {}
         self._setup_ui()
         
     def _setup_ui(self):
@@ -287,12 +321,14 @@ class RawScanDialog(QDialog):
         self.detection_list.currentRowChanged.connect(self._on_detection_selected)
         controls_layout.addWidget(self.detection_list)
         
-        # Preset selector for current detection
+        # Preset selector for current detection (botón con menú de carpetas colapsables)
         preset_group = QGroupBox("Tipo de Texto")
         preset_layout = QFormLayout(preset_group)
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(self._presets)
-        self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
+        self.preset_combo = QPushButton()
+        self.preset_combo.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 24px 4px 8px; }"
+        )
+        self._populate_preset_combo()
         preset_layout.addRow("Preset:", self.preset_combo)
         controls_layout.addWidget(preset_group)
         
@@ -499,7 +535,7 @@ class RawScanDialog(QDialog):
         
         # Update preset combo
         self.preset_combo.blockSignals(True)
-        self.preset_combo.setCurrentText(detection.preset)
+        self._set_combo_preset(detection.preset)
         self.preset_combo.blockSignals(False)
         
         # Highlight in scene
@@ -507,18 +543,80 @@ class RawScanDialog(QDialog):
             if isinstance(scene_item, DetectionBoxItem):
                 scene_item.setSelected(scene_item.detection_id == detection.id)
     
-    def _on_preset_changed(self, preset: str):
-        """Update preset for current detection"""
+    def _populate_preset_combo(self):
+        """Construye un QMenu con subcarpetas colapsables y lo asigna al botón de preset."""
+        menu = QMenu(self.preset_combo)
+
+        def _make_action(pname: str, parent_menu: QMenu) -> QAction:
+            act = QAction(pname, parent_menu)
+            act.setData(pname)
+            act.triggered.connect(lambda _checked=False, p=pname: self._on_preset_menu_selected(p))
+            return act
+
+        if self._folders and self._folder_map:
+            folder_menus: Dict[str, QMenu] = {}
+            no_folder_presets: List[str] = []
+
+            # Crear submenús en el orden de las carpetas
+            for folder in self._folders:
+                fid  = folder.get('id', '')
+                fname = folder.get('name', fid)
+                # Sólo crear si hay al menos un preset asignado
+                has_items = any(self._folder_map.get(p) == fid for p in self._presets)
+                if not has_items:
+                    continue
+                submenu = QMenu(f"📁 {fname}", menu)
+                folder_menus[fid] = submenu
+                menu.addMenu(submenu)
+
+            # Añadir presets a sus carpetas o a la lista sin carpeta
+            for pname in self._presets:
+                fid = self._folder_map.get(pname, '')
+                if fid and fid in folder_menus:
+                    folder_menus[fid].addAction(_make_action(pname, folder_menus[fid]))
+                else:
+                    no_folder_presets.append(pname)
+
+            # Presets sin carpeta al final
+            if no_folder_presets:
+                if folder_menus:
+                    menu.addSeparator()
+                for pname in no_folder_presets:
+                    menu.addAction(_make_action(pname, menu))
+        else:
+            # Lista plana si no hay carpetas
+            for pname in self._presets:
+                menu.addAction(_make_action(pname, menu))
+
+        self.preset_combo.setMenu(menu)
+
+        # Mostrar el primer preset en el botón
+        first = self._presets[0] if self._presets else "—"
+        self.preset_combo.setText(first)
+
+    def _on_preset_menu_selected(self, preset: str):
+        """Se llama cuando el usuario elige un preset del menú."""
+        self.preset_combo.setText(preset)
+
         row = self.detection_list.currentRow()
         if row < 0:
             return
-        
-        item = self.detection_list.item(row)
-        detection = item.data(Qt.ItemDataRole.UserRole)
+        list_item = self.detection_list.item(row)
+        detection = list_item.data(Qt.ItemDataRole.UserRole)
         detection.preset = preset
-        
-        # Update list item text
-        item.setText(f"{detection.id:02d} · {detection.preset}")
+        list_item.setText(f"{detection.id:02d} · {detection.preset}")
+
+    def _set_combo_preset(self, preset_name: str):
+        """Actualiza el texto del botón para reflejar el preset dado."""
+        self.preset_combo.setText(preset_name)
+
+    def _get_combo_preset(self) -> str:
+        """Devuelve el nombre del preset actualmente mostrado en el botón."""
+        return self.preset_combo.text()
+
+    def _on_preset_index_changed(self, index: int):
+        """Obsoleto: se mantiene por compatibilidad pero ya no se usa."""
+        pass
     
     def _delete_selected(self):
         """Delete selected detection"""
@@ -573,12 +671,14 @@ class RawScanDialog(QDialog):
 class TranslationInputDialog(QDialog):
     """Dialog for inputting translations"""
     
-    def __init__(self, detections: List[TextBoxDetection], parent=None):
+    def __init__(self, detections: List[TextBoxDetection], parent=None,
+                 presets: Optional[List[str]] = None):
         super().__init__(parent)
         self.setWindowTitle("Paso 2: Ingresar Traducciones")
         self.resize(800, 600)
-        
+
         self.detections = detections
+        self._presets: List[str] = presets or []
         self._setup_ui()
     
     def _setup_ui(self):
@@ -592,7 +692,8 @@ class TranslationInputDialog(QDialog):
         # Instructions
         instructions = QLabel(
             "• Pega un texto por línea, en orden numérico (01, 02, 03...)\n"
-            "• Puedes usar identificadores opcionales: 'Globo 1:' o 'G1:', 'N/T:', etc.\n"
+            "• Identificadores estándar: 'G1:', 'N/T:', '[]:', '():', '*:', 'TITULO:', etc.\n"
+            "• También puedes usar el nombre del preset directamente: 'Cuadros chicos: texto'\n"
             "• El preview muestra cómo se asignarán los textos"
         )
         instructions.setStyleSheet("color: #9ca3af; padding: 5px 10px;")
@@ -681,7 +782,7 @@ class TranslationInputDialog(QDialog):
         for i, detection in enumerate(self.detections):
             raw_text = lines[i] if i < len(lines) else ""
             if raw_text:
-                preset, clean_text, had_id = parse_identifier(raw_text)
+                preset, clean_text, had_id = parse_identifier_extended(raw_text, self._presets)
                 detection.text = clean_text
                 if had_id:
                     detection.preset = preset
@@ -852,31 +953,40 @@ class CleanImagesDialog(QDialog):
 class WorkflowWizard(QDialog):
     """Main wizard that orchestrates the 3-step workflow"""
 
-    def __init__(self, parent=None, presets: Optional[List[str]] = None):
+    def __init__(self, parent=None, presets: Optional[List[str]] = None,
+                 folders: Optional[List[Dict]] = None,
+                 folder_map: Optional[Dict[str, str]] = None):
         super().__init__(parent)
         self.setWindowTitle("Workflow Automático de Traducción")
         self.setModal(True)
 
         self.workflow_data = WorkflowData()
         self._presets = presets
+        self._folders: List[Dict] = folders or []
+        self._folder_map: Dict[str, str] = folder_map or {}
         
     def run(self) -> Optional[WorkflowData]:
         """Run the complete workflow, returns WorkflowData if successful"""
         
         # Step 1: RAW Scan
-        raw_dialog = RawScanDialog(self.parent(), presets=self._presets)
+        raw_dialog = RawScanDialog(
+            self.parent(),
+            presets=self._presets,
+            folders=self._folders,
+            folder_map=self._folder_map,
+        )
         if raw_dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        
+
         raw_path, detections = raw_dialog.get_data()
         if not raw_path or not detections:
             return None
-        
+
         self.workflow_data.raw_image_path = raw_path
         self.workflow_data.detections = detections
-        
+
         # Step 2: Translations
-        trans_dialog = TranslationInputDialog(detections, self.parent())
+        trans_dialog = TranslationInputDialog(detections, self.parent(), presets=self._presets)
         if trans_dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         

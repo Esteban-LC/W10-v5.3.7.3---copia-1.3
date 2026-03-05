@@ -30,7 +30,7 @@ import zipfile
 import shutil
 
 
-from PyQt6.QtCore import Qt, QPoint, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer, pyqtSignal, QEvent
+from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
@@ -2637,217 +2637,6 @@ def _new_folder_id() -> str:
     import random, string
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
-
-def _parse_tpl_presets(data: bytes) -> list:
-    """Parsea un archivo .tpl binario de Photoshop (cabecera 8BTP).
-
-    Devuelve una lista de dicts con las claves:
-      name, font, bold, italic, size, align, fill_color,
-      all_caps, stroke_color, stroke_size, stroke_enabled
-    """
-    import struct as _struct
-
-    if not data.startswith(b'8BTP'):
-        raise ValueError("No es un archivo .tpl válido de Photoshop (se esperaba cabecera '8BTP')")
-
-    # ── helpers de bajo nivel ────────────────────────────────────────────────
-    def _u32(p):
-        return _struct.unpack_from('>I', data, p)[0]
-
-    def _i32(p):
-        return _struct.unpack_from('>i', data, p)[0]
-
-    def _f64(p):
-        return _struct.unpack_from('>d', data, p)[0]
-
-    def _u8(p):
-        return data[p] if p < len(data) else 0
-
-    def _find(needle, s=0, e=None):
-        return data.find(needle, s, e if e is not None else len(data))
-
-    def _decode_utf16(raw):
-        """Intenta decodificar bytes como UTF-16 LE (Photoshop) con fallback BE."""
-        for enc in ('utf-16-le', 'utf-16-be'):
-            try:
-                s = raw.decode(enc)
-                if all(c.isprintable() or c == ' ' for c in s):
-                    return s
-            except Exception:
-                pass
-        return raw.decode('latin-1', errors='replace')
-
-    def _read_text(key4: bytes, s: int, e: int) -> str:
-        """Busca key4 + 'TEXT' y devuelve la cadena UTF-16 que sigue."""
-        p = _find(key4 + b'TEXT', s, e)
-        if p == -1:
-            return ''
-        p += len(key4) + 4          # saltar la etiqueta 'TEXT'
-        try:
-            count = _u32(p);  p += 4
-            if count == 0 or count > 512:
-                return ''
-            return _decode_utf16(data[p: p + count * 2]).strip()
-        except Exception:
-            return ''
-
-    def _read_unt_float(key: bytes, s: int, e: int):
-        """Busca key + 'UntF' y devuelve el double de 8 bytes que sigue (después de la etiqueta de unidad)."""
-        p = _find(key + b'UntF', s, e)
-        if p == -1:
-            return None
-        p += len(key) + 4 + 4      # saltar 'UntF' + etiqueta unidad (4 bytes)
-        try:
-            return _f64(p)
-        except Exception:
-            return None
-
-    def _read_long(key: bytes, s: int, e: int):
-        """Busca key + 'long' y devuelve el int32 que sigue."""
-        p = _find(key + b'long', s, e)
-        if p == -1:
-            return None
-        p += len(key) + 4
-        try:
-            return _i32(p)
-        except Exception:
-            return None
-
-    def _read_bool(key: bytes, s: int, e: int) -> bool:
-        """Busca key + 'bool' y devuelve el byte booleano que sigue."""
-        p = _find(key + b'bool', s, e)
-        if p == -1:
-            return False
-        p += len(key) + 4
-        try:
-            return _u8(p) != 0
-        except Exception:
-            return False
-
-    def _read_gray(color_key: bytes, s: int, e: int):
-        """Busca color_key+'Objc' y extrae el valor 'Gry '+doub (0-100, PS gray%)."""
-        p = _find(color_key + b'Objc', s, e)
-        if p == -1:
-            return None
-        ss = p + len(color_key) + 4
-        se = min(ss + 512, e if e is not None else len(data))
-        gp = _find(b'Gry ' + b'doub', ss, se)
-        if gp == -1:
-            return None
-        try:
-            return _f64(gp + 8)     # 8 = len('Gry ') + len('doub')
-        except Exception:
-            return None
-
-    def _gray_to_hex(v: float) -> str:
-        """Convierte 0-100 PS grayscale (0=blanco, 100=negro) a color hex."""
-        lum = max(0, min(255, round((1.0 - v / 100.0) * 255)))
-        return f'#{lum:02X}{lum:02X}{lum:02X}'
-
-    # ── Localizar bloques de presets ────────────────────────────────────────
-    MARKER = b'typeCreateOrEditTool'
-    positions = []
-    pos = 0
-    while True:
-        idx = data.find(MARKER, pos)
-        if idx == -1:
-            break
-        positions.append(idx)
-        pos = idx + 1
-
-    presets = []
-
-    for i, mpos in enumerate(positions):
-        block_s = mpos
-        block_e = positions[i + 1] if i + 1 < len(positions) else len(data)
-
-        # ── Nombre del preset (UTF-16 LE justo antes del marcador) ─────────
-        # Estructura: [...][count_BE=N][name_UTF16, N*2 bytes]
-        #             [4 nulls][length_BE=20]["typeCreateOrEditTool"]
-        # Los 8 bytes que preceden al marcador son: \x00\x00\x00\x00 + \x00\x00\x00\x14
-        name = ''
-        for extra in (8, 4, 0, 12, 16):
-            if name:
-                break
-            for name_len in range(60, 1, -1):
-                count_pos = mpos - extra - name_len * 2 - 4
-                if count_pos < 4:
-                    continue
-                try:
-                    if _u32(count_pos) != name_len:
-                        continue
-                    raw_name = data[count_pos + 4: count_pos + 4 + name_len * 2]
-                    decoded = _decode_utf16(raw_name).strip()
-                    # Validar: debe comenzar con dígito o letra y ser legible
-                    if (decoded and len(decoded) >= 2 and
-                            (decoded[0].isdigit() or decoded[0].isalpha()) and
-                            all(c.isprintable() or c == ' ' for c in decoded)):
-                        name = decoded
-                        break
-                except Exception:
-                    pass
-
-        if not name:
-            continue
-
-        # ── Fuente ─────────────────────────────────────────────────────────
-        font_family = _read_text(b'FntN', block_s, block_e)
-        font_style  = _read_text(b'FntS', block_s, block_e).lower()
-        syn_bold    = _read_bool(b'syntheticBold',   block_s, block_e)
-        syn_italic  = _read_bool(b'syntheticItalic', block_s, block_e)
-        is_bold     = syn_bold   or 'bold'   in font_style
-        is_italic   = syn_italic or 'italic' in font_style
-
-        # ── Tamaño (puntos) ────────────────────────────────────────────────
-        size_pt = _read_unt_float(b'Sz  ', block_s, block_e)
-        size = max(4, round(size_pt)) if size_pt is not None else 24
-
-        # ── Alineación ─────────────────────────────────────────────────────
-        p_alg = _find(b'Algn' + b'enum', block_s, block_e)
-        align = 'center'
-        if p_alg != -1:
-            # 'Algn'(4) + 'enum'(4) + typeID(4) + value(4)
-            try:
-                val = data[p_alg + 12: p_alg + 16].decode('latin-1').strip('\x00').strip()
-                if val in ('Rght', 'rght'):
-                    align = 'right'
-                elif val.startswith('Lft') or val.startswith('lft'):
-                    align = 'left'
-                else:
-                    align = 'center'
-            except Exception:
-                pass
-
-        # ── Mayúsculas ─────────────────────────────────────────────────────
-        all_caps = _find(b'allCaps', block_s, block_e) != -1
-
-        # ── Color de relleno (escala de grises PS, 0-100) ──────────────────
-        fill_gray  = _read_gray(b'Clr ', block_s, block_e)
-        fill_color = _gray_to_hex(fill_gray) if fill_gray is not None else '#000000'
-
-        # ── Contorno / stroke ──────────────────────────────────────────────
-        stroke_enabled = _read_bool(b'Strk', block_s, block_e)
-        stroke_width   = _read_unt_float(b'lineWidth',   block_s, block_e)
-        stroke_size    = max(0, round(stroke_width)) if stroke_width is not None else 0
-        stroke_gray    = _read_gray(b'strokeColor', block_s, block_e)
-        stroke_color   = _gray_to_hex(stroke_gray) if stroke_gray is not None else '#FFFFFF'
-
-        presets.append({
-            'name':           name,
-            'font':           font_family or 'Arial',
-            'bold':           is_bold,
-            'italic':         is_italic,
-            'size':           size,
-            'align':          align,
-            'fill_color':     fill_color,
-            'all_caps':       all_caps,
-            'stroke_color':   stroke_color,
-            'stroke_size':    stroke_size,
-            'stroke_enabled': stroke_enabled and stroke_size > 0,
-        })
-
-    return presets
-
 def load_folders_from_settings(settings: QSettings) -> None:
     """Carga carpetas y mapa de asignación desde QSettings."""
     global PRESET_FOLDERS, PRESET_FOLDER_MAP
@@ -4447,7 +4236,10 @@ class MangaTextTool(QMainWindow):
         unlock_sel  = self.add_act(tb, 'unlock.png', "Desbloquear seleccionados • Ctrl+U", self.unlock_selected_items_confirm, "Ctrl+U")
         close_tab_act = self.add_act(tb, 'trash.png', "Cerrar pestaña actual • Ctrl+F4", self.close_current_tab, "Ctrl+F4")
 
-        info = self.add_act(tb, 'help.png', "Ayuda: atajos y consejos", self._show_help_dialog)
+        info = self.add_act(tb, 'help.png', "Ayuda: atajos y consejos", lambda: QMessageBox.information(self, "Ayuda",
+            "Workflow Automático (Ctrl+W) → automatiza RAW → Traducción → Imágenes Limpias → Colocación de textos.\n"
+            "Ctrl+esquina: escala; círculo superior: rotar.\n"
+            "Fijar seleccionados: bloquea movimiento, rotación y resize (sigue seleccionable)."))
 
         # Actualizaciones
         update_act = self.add_act(tb, 'upload.png', "Buscar actualizaciones", lambda: self.check_for_updates(True))
@@ -4523,117 +4315,6 @@ class MangaTextTool(QMainWindow):
             orig_resize(event)
             QTimer.singleShot(0, _wire_ext_btn)
         tb.resizeEvent = _resize_hook
-
-    def _show_help_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Atajos de Teclado – Ayuda")
-        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
-        dlg.setFixedSize(540, 600)
-        dlg.setStyleSheet("""
-            QDialog { background:#0B1628; }
-            QTextEdit {
-                background:#0B1628; color:#E2E8F0;
-                border:none; font-size:13px;
-            }
-            QPushButton {
-                background:#1D4ED8; color:white; border:none;
-                border-radius:8px; padding:6px 24px;
-                font-weight:bold; font-size:13px;
-            }
-            QPushButton:hover { background:#2563EB; }
-        """)
-
-        K = (
-            "background-color:#182438; color:#E2E8F0;"
-            "border:1px solid #334155; border-radius:4px;"
-            "padding:1px 7px; font-family:Consolas,'Courier New',monospace;"
-            "font-size:12px; font-weight:bold;"
-        )
-
-        def kbd(label):
-            return f'<span style="{K}">{label}</span>'
-
-        rows = [
-            (kbd("Ctrl+O"),
-             "Abrir imagen(es) o proyecto(s)"),
-            (kbd("T"),
-             "Pegar texto &nbsp;<small style='color:#64748B;'>(una línea = una caja)</small>"),
-            (kbd("Supr"),
-             "Borrar caja seleccionada"),
-            (f'{kbd("Ctrl+Z")} &nbsp;/&nbsp; {kbd("Ctrl+Y")}',
-             "Deshacer / Rehacer"),
-            (kbd("Ctrl+W"),
-             "Workflow automático &nbsp;<small style='color:#64748B;'>(RAW → Limpias → Textos)</small>"),
-            (kbd("S"),
-             "Auto-colocar cajas &nbsp;<small style='color:#64748B;'>(evita solapados)</small>"),
-            (f'{kbd("↑")} {kbd("↓")} {kbd("←")} {kbd("→")}',
-             "Mover caja poco a poco &nbsp;<small style='color:#64748B;'>(1 px)</small>"),
-            (f'{kbd("Shift")} + {kbd("↑↓←→")}',
-             "Mover más rápido &nbsp;<small style='color:#64748B;'>(10 px)</small>"),
-            (kbd("M"),
-             "Bloqueo global de movimiento"),
-            (kbd("N"),
-             "Mostrar / Ocultar numeración de cajas"),
-            (kbd("Ctrl+L"),
-             "Fijar seleccionados &nbsp;<small style='color:#64748B;'>(bloquea mov., rot. y resize)</small>"),
-            (kbd("Ctrl+Shift+L"),
-             "Fijar TODOS en la pestaña"),
-            (kbd("Ctrl+U"),
-             "Desbloquear seleccionados"),
-            (kbd("Ctrl+B"),
-             "Negrita selectiva &nbsp;<small style='color:#64748B;'>(en edición de texto)</small>"),
-            (kbd("Ctrl+S"),
-             "Guardar proyecto &nbsp;<small style='color:#64748B;'>(.bbg)</small>"),
-            (kbd("Ctrl+F4"),
-             "Cerrar pestaña actual"),
-        ]
-
-        mouse_rows = [
-            (f'{kbd("Ctrl")} + esquina de caja', "Escalar caja"),
-            ("Círculo superior de caja",          "Rotar caja"),
-        ]
-
-        def make_table(data):
-            html = '<table width="100%" cellspacing="0" cellpadding="0">'
-            for i, (key, desc) in enumerate(data):
-                bg = "#0F1D2E" if i % 2 == 0 else "#0B1628"
-                html += (
-                    f'<tr style="background:{bg};">'
-                    f'<td style="white-space:nowrap; padding:6px 8px;">{key}</td>'
-                    f'<td style="color:#475569; text-align:center; padding:6px 4px;">→</td>'
-                    f'<td style="color:#CBD5E1; padding:6px 8px;">{desc}</td>'
-                    f'</tr>'
-                )
-            html += '</table>'
-            return html
-
-        section_title = (
-            "font-size:14px; font-weight:bold; color:#F97316; margin:0 0 6px 0;"
-        )
-        html = (
-            f'<div style="padding:6px 2px;">'
-            f'<p style="{section_title}">&#9000; Atajos útiles</p>'
-            + make_table(rows) +
-            f'<p style="{section_title}; margin-top:14px;">&#128432; Ratón</p>'
-            + make_table(mouse_rows) +
-            f'</div>'
-        )
-
-        te = QTextEdit()
-        te.setHtml(html)
-        te.setReadOnly(True)
-
-        close_btn = QPushButton("Cerrar")
-        close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        close_btn.clicked.connect(dlg.accept)
-
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(16, 16, 16, 14)
-        lay.setSpacing(10)
-        lay.addWidget(te)
-        lay.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        dlg.exec()
 
     def show_about_dialog(self):
         dlg = QDialog(self)
@@ -4818,8 +4499,6 @@ class MangaTextTool(QMainWindow):
 
         self.prop_dock = QDockWidget("Propiedades", self)
         self.prop_dock.setObjectName("PropDock")
-        self.prop_dock.installEventFilter(self)
-        self._clamping_prop_dock = False
 
         self.prop_panel = QWidget()
         self.prop_panel.setStyleSheet(PANEL_SS)
@@ -4837,13 +4516,10 @@ class MangaTextTool(QMainWindow):
 
         self.prop_content_widget = QWidget()
         self.prop_content_widget.setObjectName("PropContent")
-        # Sin ancho mínimo fijo: el content siempre se adapta al ancho disponible del panel
-        self.prop_content_widget.setMinimumWidth(0)
         scroll = QScrollArea()
         scroll.setWidget(self.prop_content_widget)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         root_vbox.addWidget(scroll, 1)
 
@@ -4882,9 +4558,6 @@ class MangaTextTool(QMainWindow):
         self.font_btn.setEnabled(False)
         self.font_btn.setToolTip("Selecciona una caja de texto para ver/cambiar su fuente")
         self.font_btn.clicked.connect(self.choose_font)
-        # Permitir que el botón encoja cuando el panel es estrecho (evita overflow del color swatch)
-        self.font_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.font_btn.setMinimumWidth(50)
 
         self.fill_btn = QPushButton()
         self.fill_btn.hide()
@@ -4965,12 +4638,6 @@ class MangaTextTool(QMainWindow):
         self.warp_orient_combo = QComboBox()
         self.warp_orient_combo.addItems(["Horizontal", "Vertical"])
         self.warp_orient_combo.currentIndexChanged.connect(self.on_warp_controls_changed)
-
-        # Permitir que los combos encojan dentro del panel sin desbordarse por la derecha
-        for _cb in (self.symb_combo, self.cap_combo, self.warp_style_combo, self.warp_orient_combo):
-            _cb.setMinimumContentsLength(4)
-            _cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-            _cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.warp_bend_slider = QSlider(Qt.Orientation.Horizontal)
         self.warp_bend_slider.setRange(-100, 100)
@@ -5151,11 +4818,11 @@ class MangaTextTool(QMainWindow):
         self.prop_dock.setWidget(self.prop_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.prop_dock)
         # Ancho fijo y consistente para evitar diferencias visuales por resolución/DPI.
-        target_width = 310
+        target_width = 260
         self._prop_expanded_width = target_width
         self._prop_collapsed_width = 32
-        self.prop_dock.setMinimumWidth(240)
-        self.prop_dock.setMaximumWidth(420)
+        self.prop_dock.setMinimumWidth(180)
+        self.prop_dock.setMaximumWidth(300)
         QTimer.singleShot(
             0,
             lambda: self.resizeDocks([self.prop_dock], [target_width], Qt.Orientation.Horizontal)
@@ -5197,65 +4864,11 @@ class MangaTextTool(QMainWindow):
     def _on_prop_top_level_changed(self, floating: bool):
         """Ajusta restricciones de ancho según si el panel está flotante o anclado."""
         if floating:
-            self.prop_dock.setMinimumWidth(310)
-            self.prop_dock.setMaximumWidth(16777215)
-            QTimer.singleShot(0, self.prop_dock.raise_)
-            QTimer.singleShot(50, self._clamp_prop_dock)
-            # Timer continuo: mantiene el dock dentro de la pantalla mientras se arrastra
-            if not hasattr(self, '_dock_clamp_timer'):
-                self._dock_clamp_timer = QTimer(self)
-                self._dock_clamp_timer.setInterval(80)
-                self._dock_clamp_timer.timeout.connect(self._clamp_prop_dock)
-            self._dock_clamp_timer.start()
-        else:
-            if hasattr(self, '_dock_clamp_timer'):
-                self._dock_clamp_timer.stop()
             self.prop_dock.setMinimumWidth(240)
-            self.prop_dock.setMaximumWidth(420)
-
-    def eventFilter(self, obj, event):
-        if (obj is getattr(self, 'prop_dock', None)
-                and event.type() == QEvent.Type.Move
-                and getattr(self, 'prop_dock', None) is not None
-                and self.prop_dock.isFloating()
-                and not self._clamping_prop_dock):
-            self._clamping_prop_dock = True
-            self._clamp_prop_dock()
-            self._clamping_prop_dock = False
-        return super().eventFilter(obj, event)
-
-    def _clamp_prop_dock(self):
-        if not getattr(self, 'prop_dock', None) or not self.prop_dock.isFloating():
-            return
-        # mapToGlobal da coordenadas REALES de pantalla (pos() es relativo al padre)
-        global_pos = self.prop_dock.mapToGlobal(QPoint(0, 0))
-        dock_w = self.prop_dock.width()
-        dock_h = self.prop_dock.height()
-        screen = QGuiApplication.screenAt(global_pos)
-        if screen is None:
-            screen = QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-        avail = screen.availableGeometry()
-        gx = global_pos.x()
-        gy = global_pos.y()
-        # Tope derecho: el borde derecho del dock no puede salir de la pantalla
-        if gx + dock_w > avail.right() + 1:
-            gx = avail.right() + 1 - dock_w
-        if gx < avail.left():
-            gx = avail.left()
-        if gy + dock_h > avail.bottom() + 1:
-            gy = avail.bottom() + 1 - dock_h
-        if gy < avail.top():
-            gy = avail.top()
-        dx = gx - global_pos.x()
-        dy = gy - global_pos.y()
-        if dx != 0 or dy != 0:
-            # move() usa coordenadas relativas al padre → sumamos el delta
-            cur = self.prop_dock.pos()
-            self._clamping_prop_dock = True
-            self.prop_dock.move(cur.x() + dx, cur.y() + dy)
-            self._clamping_prop_dock = False
+            self.prop_dock.setMaximumWidth(16777215)
+        else:
+            self.prop_dock.setMinimumWidth(180)
+            self.prop_dock.setMaximumWidth(300)
 
     def toggle_prop_panel(self, checked: bool):
         """Colapsa/expande el panel de propiedades al estilo Photoshop."""
@@ -5279,18 +4892,10 @@ class MangaTextTool(QMainWindow):
             self.prop_content_widget.show()
             self.prop_panel.setMinimumWidth(0)
             self.prop_panel.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
-            if self.prop_dock.isFloating():
-                min_w, max_w = 310, 16777215
-            else:
-                min_w, max_w = 240, 420
-            self.prop_dock.setMinimumWidth(min_w)
-            self.prop_dock.setMaximumWidth(max_w)
-            target_w = max(min_w, min(420, int(getattr(self, "_prop_expanded_width", 310))))
-            if self.prop_dock.isFloating():
-                self.prop_dock.resize(target_w, self.prop_dock.height())
-                QTimer.singleShot(50, self._clamp_prop_dock)
-            else:
-                self.resizeDocks([self.prop_dock], [target_w], Qt.Orientation.Horizontal)
+            self.prop_dock.setMinimumWidth(180)
+            self.prop_dock.setMaximumWidth(300)
+            target_w = max(180, min(300, int(getattr(self, "_prop_expanded_width", 260))))
+            self.resizeDocks([self.prop_dock], [target_w], Qt.Orientation.Horizontal)
             # Flecha hacia la derecha (indica que se puede colapsar)
             self.prop_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
     # ---------------- Acciones principales ----------------
@@ -5443,12 +5048,7 @@ class MangaTextTool(QMainWindow):
         
         try:
             # Run the wizard
-            wizard = WorkflowWizard(
-                self,
-                presets=list(PRESETS.keys()),
-                folders=PRESET_FOLDERS,
-                folder_map=PRESET_FOLDER_MAP,
-            )
+            wizard = WorkflowWizard(self, presets=list(PRESETS.keys()))
             workflow_data = wizard.run()
             
             if not workflow_data:
@@ -6240,39 +5840,8 @@ class MangaTextTool(QMainWindow):
             QMessageBox.warning(self, "Exportar", f"No se pudo exportar:\n{e}")
 
     def import_presets_json(self):
-        fname, _ = QFileDialog.getOpenFileName(
-            self, "Importar presets", "",
-            "Presets (*.json *.tpl);;JSON TyperTools/Manga (*.json);;Photoshop TPL (*.tpl)"
-        )
-        if not fname:
-            return
-
-        # ── Formato Photoshop .tpl ──────────────────────────────────────────
-        if fname.lower().endswith('.tpl'):
-            try:
-                with open(fname, "rb") as f:
-                    raw_bytes = f.read()
-                converted = self._import_from_tpl(raw_bytes)
-                if not converted:
-                    QMessageBox.warning(self, "Importar TPL",
-                        "No se encontraron presets válidos en el archivo .tpl.")
-                    return
-                for k, v in converted.items():
-                    PRESETS[k] = v
-                if upgrade_presets_with_defaults(PRESETS): pass
-                save_presets_to_settings(self.settings, PRESETS)
-                self.symb_combo.blockSignals(True)
-                self.symb_combo.clear()
-                self.symb_combo.addItems(list(PRESETS.keys()))
-                self.symb_combo.blockSignals(False)
-                QMessageBox.information(self, "Importar TPL",
-                    f"✓ {len(converted)} preset(s) importados desde Photoshop .tpl\n"
-                    f"({', '.join(list(converted.keys())[:5])}"
-                    f"{'...' if len(converted) > 5 else ''})")
-            except Exception as e:
-                QMessageBox.warning(self, "Importar TPL", f"No se pudo importar:\n{e}")
-            return
-
+        fname, _ = QFileDialog.getOpenFileName(self, "Importar presets", "", "JSON (*.json)")
+        if not fname: return
         try:
             with open(fname, "r", encoding="utf-8") as f: raw = json.load(f)
 
@@ -6434,24 +6003,6 @@ class MangaTextTool(QMainWindow):
                 folder_map[name] = fid
 
         return result, folders_list, folder_map
-
-    def _import_from_tpl(self, data: bytes) -> dict:
-        """Convierte los bytes de un .tpl de Photoshop en un dict name→TextStyle."""
-        raw_presets = _parse_tpl_presets(data)
-        result = {}
-        for p in raw_presets:
-            result[p['name']] = TextStyle(
-                font_family     = p['font'],
-                bold            = p['bold'],
-                italic          = p['italic'],
-                font_point_size = p['size'],
-                alignment       = p['align'],
-                fill            = p['fill_color'],
-                capitalization  = 'uppercase' if p['all_caps'] else 'mixed',
-                outline         = p['stroke_color'],
-                outline_width   = p['stroke_size'],
-            )
-        return result
 
     def set_movement_locked(self, locked: bool):
         self.lock_move = bool(locked); self._apply_movable_all_current()

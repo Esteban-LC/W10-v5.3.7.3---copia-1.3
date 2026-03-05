@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://api.github.com/repos/ScanR/TypeR/contents/app_src/components/stylesBlock\")",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(d[''name''], d[''type'']\\) for d in data]\")"
+    ]
+  }
+}

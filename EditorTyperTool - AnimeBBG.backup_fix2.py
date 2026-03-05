@@ -30,7 +30,7 @@ import zipfile
 import shutil
 
 
-from PyQt6.QtCore import Qt, QPoint, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer, pyqtSignal, QEvent
+from PyQt6.QtCore import Qt, QPointF, QRectF, QSettings, QBuffer, QByteArray, QIODevice, QSize, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QGuiApplication, QImage, QPainter, QIcon,
@@ -836,8 +836,6 @@ class TextStyle:
     background_color: str = "#FFFFFF"
     background_opacity: float = 0.0
     capitalization: str = "mixed"
-    # Color del punto indicador en el gestor de estilos (estilo TypeR)
-    prefix_color: str = "#888888"
     def to_qfont(self) -> QFont:
         """Crea QFont desde este estilo."""
         fam = get_safe_font_family(self.font_family, fallback="Arial")
@@ -2626,247 +2624,6 @@ def save_presets_to_settings(settings: QSettings, presets: Dict[str, TextStyle])
     raw = {k: asdict(v) for k, v in presets.items()}
     settings.setValue('presets_json', json.dumps(raw))
 
-# ─── Sistema de carpetas de presets (estilo TypeR) ───────────────────────────
-# Lista de carpetas: [{"id": "abc12345", "name": "Corazones"}, ...]
-PRESET_FOLDERS: List[Dict] = []
-# Mapa preset_name → folder_id (ausente o None = sin carpeta)
-PRESET_FOLDER_MAP: Dict[str, str] = {}
-
-def _new_folder_id() -> str:
-    """Genera un ID de 8 caracteres aleatorios para una carpeta."""
-    import random, string
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-
-
-def _parse_tpl_presets(data: bytes) -> list:
-    """Parsea un archivo .tpl binario de Photoshop (cabecera 8BTP).
-
-    Devuelve una lista de dicts con las claves:
-      name, font, bold, italic, size, align, fill_color,
-      all_caps, stroke_color, stroke_size, stroke_enabled
-    """
-    import struct as _struct
-
-    if not data.startswith(b'8BTP'):
-        raise ValueError("No es un archivo .tpl válido de Photoshop (se esperaba cabecera '8BTP')")
-
-    # ── helpers de bajo nivel ────────────────────────────────────────────────
-    def _u32(p):
-        return _struct.unpack_from('>I', data, p)[0]
-
-    def _i32(p):
-        return _struct.unpack_from('>i', data, p)[0]
-
-    def _f64(p):
-        return _struct.unpack_from('>d', data, p)[0]
-
-    def _u8(p):
-        return data[p] if p < len(data) else 0
-
-    def _find(needle, s=0, e=None):
-        return data.find(needle, s, e if e is not None else len(data))
-
-    def _decode_utf16(raw):
-        """Intenta decodificar bytes como UTF-16 LE (Photoshop) con fallback BE."""
-        for enc in ('utf-16-le', 'utf-16-be'):
-            try:
-                s = raw.decode(enc)
-                if all(c.isprintable() or c == ' ' for c in s):
-                    return s
-            except Exception:
-                pass
-        return raw.decode('latin-1', errors='replace')
-
-    def _read_text(key4: bytes, s: int, e: int) -> str:
-        """Busca key4 + 'TEXT' y devuelve la cadena UTF-16 que sigue."""
-        p = _find(key4 + b'TEXT', s, e)
-        if p == -1:
-            return ''
-        p += len(key4) + 4          # saltar la etiqueta 'TEXT'
-        try:
-            count = _u32(p);  p += 4
-            if count == 0 or count > 512:
-                return ''
-            return _decode_utf16(data[p: p + count * 2]).strip()
-        except Exception:
-            return ''
-
-    def _read_unt_float(key: bytes, s: int, e: int):
-        """Busca key + 'UntF' y devuelve el double de 8 bytes que sigue (después de la etiqueta de unidad)."""
-        p = _find(key + b'UntF', s, e)
-        if p == -1:
-            return None
-        p += len(key) + 4 + 4      # saltar 'UntF' + etiqueta unidad (4 bytes)
-        try:
-            return _f64(p)
-        except Exception:
-            return None
-
-    def _read_long(key: bytes, s: int, e: int):
-        """Busca key + 'long' y devuelve el int32 que sigue."""
-        p = _find(key + b'long', s, e)
-        if p == -1:
-            return None
-        p += len(key) + 4
-        try:
-            return _i32(p)
-        except Exception:
-            return None
-
-    def _read_bool(key: bytes, s: int, e: int) -> bool:
-        """Busca key + 'bool' y devuelve el byte booleano que sigue."""
-        p = _find(key + b'bool', s, e)
-        if p == -1:
-            return False
-        p += len(key) + 4
-        try:
-            return _u8(p) != 0
-        except Exception:
-            return False
-
-    def _read_gray(color_key: bytes, s: int, e: int):
-        """Busca color_key+'Objc' y extrae el valor 'Gry '+doub (0-100, PS gray%)."""
-        p = _find(color_key + b'Objc', s, e)
-        if p == -1:
-            return None
-        ss = p + len(color_key) + 4
-        se = min(ss + 512, e if e is not None else len(data))
-        gp = _find(b'Gry ' + b'doub', ss, se)
-        if gp == -1:
-            return None
-        try:
-            return _f64(gp + 8)     # 8 = len('Gry ') + len('doub')
-        except Exception:
-            return None
-
-    def _gray_to_hex(v: float) -> str:
-        """Convierte 0-100 PS grayscale (0=blanco, 100=negro) a color hex."""
-        lum = max(0, min(255, round((1.0 - v / 100.0) * 255)))
-        return f'#{lum:02X}{lum:02X}{lum:02X}'
-
-    # ── Localizar bloques de presets ────────────────────────────────────────
-    MARKER = b'typeCreateOrEditTool'
-    positions = []
-    pos = 0
-    while True:
-        idx = data.find(MARKER, pos)
-        if idx == -1:
-            break
-        positions.append(idx)
-        pos = idx + 1
-
-    presets = []
-
-    for i, mpos in enumerate(positions):
-        block_s = mpos
-        block_e = positions[i + 1] if i + 1 < len(positions) else len(data)
-
-        # ── Nombre del preset (UTF-16 LE justo antes del marcador) ─────────
-        # Estructura: [...][count_BE=N][name_UTF16, N*2 bytes]
-        #             [4 nulls][length_BE=20]["typeCreateOrEditTool"]
-        # Los 8 bytes que preceden al marcador son: \x00\x00\x00\x00 + \x00\x00\x00\x14
-        name = ''
-        for extra in (8, 4, 0, 12, 16):
-            if name:
-                break
-            for name_len in range(60, 1, -1):
-                count_pos = mpos - extra - name_len * 2 - 4
-                if count_pos < 4:
-                    continue
-                try:
-                    if _u32(count_pos) != name_len:
-                        continue
-                    raw_name = data[count_pos + 4: count_pos + 4 + name_len * 2]
-                    decoded = _decode_utf16(raw_name).strip()
-                    # Validar: debe comenzar con dígito o letra y ser legible
-                    if (decoded and len(decoded) >= 2 and
-                            (decoded[0].isdigit() or decoded[0].isalpha()) and
-                            all(c.isprintable() or c == ' ' for c in decoded)):
-                        name = decoded
-                        break
-                except Exception:
-                    pass
-
-        if not name:
-            continue
-
-        # ── Fuente ─────────────────────────────────────────────────────────
-        font_family = _read_text(b'FntN', block_s, block_e)
-        font_style  = _read_text(b'FntS', block_s, block_e).lower()
-        syn_bold    = _read_bool(b'syntheticBold',   block_s, block_e)
-        syn_italic  = _read_bool(b'syntheticItalic', block_s, block_e)
-        is_bold     = syn_bold   or 'bold'   in font_style
-        is_italic   = syn_italic or 'italic' in font_style
-
-        # ── Tamaño (puntos) ────────────────────────────────────────────────
-        size_pt = _read_unt_float(b'Sz  ', block_s, block_e)
-        size = max(4, round(size_pt)) if size_pt is not None else 24
-
-        # ── Alineación ─────────────────────────────────────────────────────
-        p_alg = _find(b'Algn' + b'enum', block_s, block_e)
-        align = 'center'
-        if p_alg != -1:
-            # 'Algn'(4) + 'enum'(4) + typeID(4) + value(4)
-            try:
-                val = data[p_alg + 12: p_alg + 16].decode('latin-1').strip('\x00').strip()
-                if val in ('Rght', 'rght'):
-                    align = 'right'
-                elif val.startswith('Lft') or val.startswith('lft'):
-                    align = 'left'
-                else:
-                    align = 'center'
-            except Exception:
-                pass
-
-        # ── Mayúsculas ─────────────────────────────────────────────────────
-        all_caps = _find(b'allCaps', block_s, block_e) != -1
-
-        # ── Color de relleno (escala de grises PS, 0-100) ──────────────────
-        fill_gray  = _read_gray(b'Clr ', block_s, block_e)
-        fill_color = _gray_to_hex(fill_gray) if fill_gray is not None else '#000000'
-
-        # ── Contorno / stroke ──────────────────────────────────────────────
-        stroke_enabled = _read_bool(b'Strk', block_s, block_e)
-        stroke_width   = _read_unt_float(b'lineWidth',   block_s, block_e)
-        stroke_size    = max(0, round(stroke_width)) if stroke_width is not None else 0
-        stroke_gray    = _read_gray(b'strokeColor', block_s, block_e)
-        stroke_color   = _gray_to_hex(stroke_gray) if stroke_gray is not None else '#FFFFFF'
-
-        presets.append({
-            'name':           name,
-            'font':           font_family or 'Arial',
-            'bold':           is_bold,
-            'italic':         is_italic,
-            'size':           size,
-            'align':          align,
-            'fill_color':     fill_color,
-            'all_caps':       all_caps,
-            'stroke_color':   stroke_color,
-            'stroke_size':    stroke_size,
-            'stroke_enabled': stroke_enabled and stroke_size > 0,
-        })
-
-    return presets
-
-def load_folders_from_settings(settings: QSettings) -> None:
-    """Carga carpetas y mapa de asignación desde QSettings."""
-    global PRESET_FOLDERS, PRESET_FOLDER_MAP
-    try:
-        fd = settings.value('preset_folders_json', type=str)
-        fm = settings.value('preset_folder_map_json', type=str)
-        PRESET_FOLDERS.clear()
-        PRESET_FOLDERS.extend(json.loads(fd) if fd else [])
-        PRESET_FOLDER_MAP.clear()
-        PRESET_FOLDER_MAP.update(json.loads(fm) if fm else {})
-    except Exception:
-        PRESET_FOLDERS.clear(); PRESET_FOLDER_MAP.clear()
-
-def save_folders_to_settings(settings: QSettings) -> None:
-    """Guarda carpetas y mapa de asignación en QSettings."""
-    settings.setValue('preset_folders_json',   json.dumps(PRESET_FOLDERS))
-    settings.setValue('preset_folder_map_json', json.dumps(PRESET_FOLDER_MAP))
-# ─────────────────────────────────────────────────────────────────────────────
-
 def upgrade_presets_with_defaults(presets: Dict[str, TextStyle]) -> bool:
     defs = default_presets(); changed = False
     for k, v in defs.items():
@@ -4017,7 +3774,6 @@ class MangaTextTool(QMainWindow):
         self.settings = QSettings('FansubTools', 'MangaTextTool')
         global PRESETS; PRESETS = load_presets_from_settings(self.settings)
         if upgrade_presets_with_defaults(PRESETS): save_presets_to_settings(self.settings, PRESETS)
-        load_folders_from_settings(self.settings)   # carga PRESET_FOLDERS y PRESET_FOLDER_MAP
 
         if str(self.settings.value('shadow_default_migrated', '0')) != '1':
             for st in PRESETS.values(): st.shadow_enabled = False
@@ -4447,7 +4203,10 @@ class MangaTextTool(QMainWindow):
         unlock_sel  = self.add_act(tb, 'unlock.png', "Desbloquear seleccionados • Ctrl+U", self.unlock_selected_items_confirm, "Ctrl+U")
         close_tab_act = self.add_act(tb, 'trash.png', "Cerrar pestaña actual • Ctrl+F4", self.close_current_tab, "Ctrl+F4")
 
-        info = self.add_act(tb, 'help.png', "Ayuda: atajos y consejos", self._show_help_dialog)
+        info = self.add_act(tb, 'help.png', "Ayuda: atajos y consejos", lambda: QMessageBox.information(self, "Ayuda",
+            "Workflow Automático (Ctrl+W) → automatiza RAW → Traducción → Imágenes Limpias → Colocación de textos.\n"
+            "Ctrl+esquina: escala; círculo superior: rotar.\n"
+            "Fijar seleccionados: bloquea movimiento, rotación y resize (sigue seleccionable)."))
 
         # Actualizaciones
         update_act = self.add_act(tb, 'upload.png', "Buscar actualizaciones", lambda: self.check_for_updates(True))
@@ -4523,117 +4282,6 @@ class MangaTextTool(QMainWindow):
             orig_resize(event)
             QTimer.singleShot(0, _wire_ext_btn)
         tb.resizeEvent = _resize_hook
-
-    def _show_help_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Atajos de Teclado – Ayuda")
-        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
-        dlg.setFixedSize(540, 600)
-        dlg.setStyleSheet("""
-            QDialog { background:#0B1628; }
-            QTextEdit {
-                background:#0B1628; color:#E2E8F0;
-                border:none; font-size:13px;
-            }
-            QPushButton {
-                background:#1D4ED8; color:white; border:none;
-                border-radius:8px; padding:6px 24px;
-                font-weight:bold; font-size:13px;
-            }
-            QPushButton:hover { background:#2563EB; }
-        """)
-
-        K = (
-            "background-color:#182438; color:#E2E8F0;"
-            "border:1px solid #334155; border-radius:4px;"
-            "padding:1px 7px; font-family:Consolas,'Courier New',monospace;"
-            "font-size:12px; font-weight:bold;"
-        )
-
-        def kbd(label):
-            return f'<span style="{K}">{label}</span>'
-
-        rows = [
-            (kbd("Ctrl+O"),
-             "Abrir imagen(es) o proyecto(s)"),
-            (kbd("T"),
-             "Pegar texto &nbsp;<small style='color:#64748B;'>(una línea = una caja)</small>"),
-            (kbd("Supr"),
-             "Borrar caja seleccionada"),
-            (f'{kbd("Ctrl+Z")} &nbsp;/&nbsp; {kbd("Ctrl+Y")}',
-             "Deshacer / Rehacer"),
-            (kbd("Ctrl+W"),
-             "Workflow automático &nbsp;<small style='color:#64748B;'>(RAW → Limpias → Textos)</small>"),
-            (kbd("S"),
-             "Auto-colocar cajas &nbsp;<small style='color:#64748B;'>(evita solapados)</small>"),
-            (f'{kbd("↑")} {kbd("↓")} {kbd("←")} {kbd("→")}',
-             "Mover caja poco a poco &nbsp;<small style='color:#64748B;'>(1 px)</small>"),
-            (f'{kbd("Shift")} + {kbd("↑↓←→")}',
-             "Mover más rápido &nbsp;<small style='color:#64748B;'>(10 px)</small>"),
-            (kbd("M"),
-             "Bloqueo global de movimiento"),
-            (kbd("N"),
-             "Mostrar / Ocultar numeración de cajas"),
-            (kbd("Ctrl+L"),
-             "Fijar seleccionados &nbsp;<small style='color:#64748B;'>(bloquea mov., rot. y resize)</small>"),
-            (kbd("Ctrl+Shift+L"),
-             "Fijar TODOS en la pestaña"),
-            (kbd("Ctrl+U"),
-             "Desbloquear seleccionados"),
-            (kbd("Ctrl+B"),
-             "Negrita selectiva &nbsp;<small style='color:#64748B;'>(en edición de texto)</small>"),
-            (kbd("Ctrl+S"),
-             "Guardar proyecto &nbsp;<small style='color:#64748B;'>(.bbg)</small>"),
-            (kbd("Ctrl+F4"),
-             "Cerrar pestaña actual"),
-        ]
-
-        mouse_rows = [
-            (f'{kbd("Ctrl")} + esquina de caja', "Escalar caja"),
-            ("Círculo superior de caja",          "Rotar caja"),
-        ]
-
-        def make_table(data):
-            html = '<table width="100%" cellspacing="0" cellpadding="0">'
-            for i, (key, desc) in enumerate(data):
-                bg = "#0F1D2E" if i % 2 == 0 else "#0B1628"
-                html += (
-                    f'<tr style="background:{bg};">'
-                    f'<td style="white-space:nowrap; padding:6px 8px;">{key}</td>'
-                    f'<td style="color:#475569; text-align:center; padding:6px 4px;">→</td>'
-                    f'<td style="color:#CBD5E1; padding:6px 8px;">{desc}</td>'
-                    f'</tr>'
-                )
-            html += '</table>'
-            return html
-
-        section_title = (
-            "font-size:14px; font-weight:bold; color:#F97316; margin:0 0 6px 0;"
-        )
-        html = (
-            f'<div style="padding:6px 2px;">'
-            f'<p style="{section_title}">&#9000; Atajos útiles</p>'
-            + make_table(rows) +
-            f'<p style="{section_title}; margin-top:14px;">&#128432; Ratón</p>'
-            + make_table(mouse_rows) +
-            f'</div>'
-        )
-
-        te = QTextEdit()
-        te.setHtml(html)
-        te.setReadOnly(True)
-
-        close_btn = QPushButton("Cerrar")
-        close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        close_btn.clicked.connect(dlg.accept)
-
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(16, 16, 16, 14)
-        lay.setSpacing(10)
-        lay.addWidget(te)
-        lay.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        dlg.exec()
 
     def show_about_dialog(self):
         dlg = QDialog(self)
@@ -4818,8 +4466,6 @@ class MangaTextTool(QMainWindow):
 
         self.prop_dock = QDockWidget("Propiedades", self)
         self.prop_dock.setObjectName("PropDock")
-        self.prop_dock.installEventFilter(self)
-        self._clamping_prop_dock = False
 
         self.prop_panel = QWidget()
         self.prop_panel.setStyleSheet(PANEL_SS)
@@ -4837,13 +4483,10 @@ class MangaTextTool(QMainWindow):
 
         self.prop_content_widget = QWidget()
         self.prop_content_widget.setObjectName("PropContent")
-        # Sin ancho mínimo fijo: el content siempre se adapta al ancho disponible del panel
-        self.prop_content_widget.setMinimumWidth(0)
         scroll = QScrollArea()
         scroll.setWidget(self.prop_content_widget)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         root_vbox.addWidget(scroll, 1)
 
@@ -4882,9 +4525,6 @@ class MangaTextTool(QMainWindow):
         self.font_btn.setEnabled(False)
         self.font_btn.setToolTip("Selecciona una caja de texto para ver/cambiar su fuente")
         self.font_btn.clicked.connect(self.choose_font)
-        # Permitir que el botón encoja cuando el panel es estrecho (evita overflow del color swatch)
-        self.font_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.font_btn.setMinimumWidth(50)
 
         self.fill_btn = QPushButton()
         self.fill_btn.hide()
@@ -4965,12 +4605,6 @@ class MangaTextTool(QMainWindow):
         self.warp_orient_combo = QComboBox()
         self.warp_orient_combo.addItems(["Horizontal", "Vertical"])
         self.warp_orient_combo.currentIndexChanged.connect(self.on_warp_controls_changed)
-
-        # Permitir que los combos encojan dentro del panel sin desbordarse por la derecha
-        for _cb in (self.symb_combo, self.cap_combo, self.warp_style_combo, self.warp_orient_combo):
-            _cb.setMinimumContentsLength(4)
-            _cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-            _cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.warp_bend_slider = QSlider(Qt.Orientation.Horizontal)
         self.warp_bend_slider.setRange(-100, 100)
@@ -5151,11 +4785,11 @@ class MangaTextTool(QMainWindow):
         self.prop_dock.setWidget(self.prop_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.prop_dock)
         # Ancho fijo y consistente para evitar diferencias visuales por resolución/DPI.
-        target_width = 310
+        target_width = 260
         self._prop_expanded_width = target_width
         self._prop_collapsed_width = 32
-        self.prop_dock.setMinimumWidth(240)
-        self.prop_dock.setMaximumWidth(420)
+        self.prop_dock.setMinimumWidth(180)
+        self.prop_dock.setMaximumWidth(300)
         QTimer.singleShot(
             0,
             lambda: self.resizeDocks([self.prop_dock], [target_width], Qt.Orientation.Horizontal)
@@ -5197,65 +4831,11 @@ class MangaTextTool(QMainWindow):
     def _on_prop_top_level_changed(self, floating: bool):
         """Ajusta restricciones de ancho según si el panel está flotante o anclado."""
         if floating:
-            self.prop_dock.setMinimumWidth(310)
-            self.prop_dock.setMaximumWidth(16777215)
-            QTimer.singleShot(0, self.prop_dock.raise_)
-            QTimer.singleShot(50, self._clamp_prop_dock)
-            # Timer continuo: mantiene el dock dentro de la pantalla mientras se arrastra
-            if not hasattr(self, '_dock_clamp_timer'):
-                self._dock_clamp_timer = QTimer(self)
-                self._dock_clamp_timer.setInterval(80)
-                self._dock_clamp_timer.timeout.connect(self._clamp_prop_dock)
-            self._dock_clamp_timer.start()
-        else:
-            if hasattr(self, '_dock_clamp_timer'):
-                self._dock_clamp_timer.stop()
             self.prop_dock.setMinimumWidth(240)
-            self.prop_dock.setMaximumWidth(420)
-
-    def eventFilter(self, obj, event):
-        if (obj is getattr(self, 'prop_dock', None)
-                and event.type() == QEvent.Type.Move
-                and getattr(self, 'prop_dock', None) is not None
-                and self.prop_dock.isFloating()
-                and not self._clamping_prop_dock):
-            self._clamping_prop_dock = True
-            self._clamp_prop_dock()
-            self._clamping_prop_dock = False
-        return super().eventFilter(obj, event)
-
-    def _clamp_prop_dock(self):
-        if not getattr(self, 'prop_dock', None) or not self.prop_dock.isFloating():
-            return
-        # mapToGlobal da coordenadas REALES de pantalla (pos() es relativo al padre)
-        global_pos = self.prop_dock.mapToGlobal(QPoint(0, 0))
-        dock_w = self.prop_dock.width()
-        dock_h = self.prop_dock.height()
-        screen = QGuiApplication.screenAt(global_pos)
-        if screen is None:
-            screen = QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-        avail = screen.availableGeometry()
-        gx = global_pos.x()
-        gy = global_pos.y()
-        # Tope derecho: el borde derecho del dock no puede salir de la pantalla
-        if gx + dock_w > avail.right() + 1:
-            gx = avail.right() + 1 - dock_w
-        if gx < avail.left():
-            gx = avail.left()
-        if gy + dock_h > avail.bottom() + 1:
-            gy = avail.bottom() + 1 - dock_h
-        if gy < avail.top():
-            gy = avail.top()
-        dx = gx - global_pos.x()
-        dy = gy - global_pos.y()
-        if dx != 0 or dy != 0:
-            # move() usa coordenadas relativas al padre → sumamos el delta
-            cur = self.prop_dock.pos()
-            self._clamping_prop_dock = True
-            self.prop_dock.move(cur.x() + dx, cur.y() + dy)
-            self._clamping_prop_dock = False
+            self.prop_dock.setMaximumWidth(16777215)
+        else:
+            self.prop_dock.setMinimumWidth(180)
+            self.prop_dock.setMaximumWidth(300)
 
     def toggle_prop_panel(self, checked: bool):
         """Colapsa/expande el panel de propiedades al estilo Photoshop."""
@@ -5279,18 +4859,10 @@ class MangaTextTool(QMainWindow):
             self.prop_content_widget.show()
             self.prop_panel.setMinimumWidth(0)
             self.prop_panel.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
-            if self.prop_dock.isFloating():
-                min_w, max_w = 310, 16777215
-            else:
-                min_w, max_w = 240, 420
-            self.prop_dock.setMinimumWidth(min_w)
-            self.prop_dock.setMaximumWidth(max_w)
-            target_w = max(min_w, min(420, int(getattr(self, "_prop_expanded_width", 310))))
-            if self.prop_dock.isFloating():
-                self.prop_dock.resize(target_w, self.prop_dock.height())
-                QTimer.singleShot(50, self._clamp_prop_dock)
-            else:
-                self.resizeDocks([self.prop_dock], [target_w], Qt.Orientation.Horizontal)
+            self.prop_dock.setMinimumWidth(180)
+            self.prop_dock.setMaximumWidth(300)
+            target_w = max(180, min(300, int(getattr(self, "_prop_expanded_width", 260))))
+            self.resizeDocks([self.prop_dock], [target_w], Qt.Orientation.Horizontal)
             # Flecha hacia la derecha (indica que se puede colapsar)
             self.prop_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
     # ---------------- Acciones principales ----------------
@@ -5443,12 +5015,7 @@ class MangaTextTool(QMainWindow):
         
         try:
             # Run the wizard
-            wizard = WorkflowWizard(
-                self,
-                presets=list(PRESETS.keys()),
-                folders=PRESET_FOLDERS,
-                folder_map=PRESET_FOLDER_MAP,
-            )
+            wizard = WorkflowWizard(self, presets=list(PRESETS.keys()))
             workflow_data = wizard.run()
             
             if not workflow_data:
@@ -6240,80 +5807,28 @@ class MangaTextTool(QMainWindow):
             QMessageBox.warning(self, "Exportar", f"No se pudo exportar:\n{e}")
 
     def import_presets_json(self):
-        fname, _ = QFileDialog.getOpenFileName(
-            self, "Importar presets", "",
-            "Presets (*.json *.tpl);;JSON TyperTools/Manga (*.json);;Photoshop TPL (*.tpl)"
-        )
-        if not fname:
-            return
-
-        # ── Formato Photoshop .tpl ──────────────────────────────────────────
-        if fname.lower().endswith('.tpl'):
-            try:
-                with open(fname, "rb") as f:
-                    raw_bytes = f.read()
-                converted = self._import_from_tpl(raw_bytes)
-                if not converted:
-                    QMessageBox.warning(self, "Importar TPL",
-                        "No se encontraron presets válidos en el archivo .tpl.")
-                    return
-                for k, v in converted.items():
-                    PRESETS[k] = v
-                if upgrade_presets_with_defaults(PRESETS): pass
-                save_presets_to_settings(self.settings, PRESETS)
-                self.symb_combo.blockSignals(True)
-                self.symb_combo.clear()
-                self.symb_combo.addItems(list(PRESETS.keys()))
-                self.symb_combo.blockSignals(False)
-                QMessageBox.information(self, "Importar TPL",
-                    f"✓ {len(converted)} preset(s) importados desde Photoshop .tpl\n"
-                    f"({', '.join(list(converted.keys())[:5])}"
-                    f"{'...' if len(converted) > 5 else ''})")
-            except Exception as e:
-                QMessageBox.warning(self, "Importar TPL", f"No se pudo importar:\n{e}")
-            return
-
+        fname, _ = QFileDialog.getOpenFileName(self, "Importar presets", "", "JSON (*.json)")
+        if not fname: return
         try:
             with open(fname, "r", encoding="utf-8") as f: raw = json.load(f)
 
-            # ── Detectar formato TyperTools/TypeR (tiene clave "styles" con lista) ──
+            # ── Detectar formato TyperTools (tiene clave "styles" con lista) ──
             if isinstance(raw, dict) and "styles" in raw and isinstance(raw["styles"], list):
-                converted, new_folders, new_folder_map = self._import_from_typertools(raw)
+                converted = self._import_from_typertools(raw)
                 if not converted:
-                    QMessageBox.warning(self, "Importar TyperTools/TypeR",
-                        "No se encontraron estilos válidos en el archivo TyperTools/TypeR.")
+                    QMessageBox.warning(self, "Importar TyperTools",
+                        "No se encontraron estilos válidos en el archivo TyperTools.")
                     return
-                # Añadir estilos
                 for k, v in converted.items():
                     PRESETS[k] = v
                 if upgrade_presets_with_defaults(PRESETS): pass
-                # Añadir carpetas (evitar duplicados por nombre)
-                existing_names = {f['name'] for f in PRESET_FOLDERS}
-                folder_id_remap: Dict[str, str] = {}   # old_id → id usado en PRESET_FOLDERS
-                for folder in new_folders:
-                    if folder['name'] not in existing_names:
-                        new_id = _new_folder_id()
-                        folder_id_remap[folder['id']] = new_id
-                        PRESET_FOLDERS.append({"id": new_id, "name": folder['name']})
-                    else:
-                        # Reusar el id existente con ese nombre
-                        existing = next(f for f in PRESET_FOLDERS if f['name'] == folder['name'])
-                        folder_id_remap[folder['id']] = existing['id']
-                # Aplicar mapa de carpeta para cada estilo importado
-                for style_name, old_fid in new_folder_map.items():
-                    if old_fid and old_fid in folder_id_remap:
-                        PRESET_FOLDER_MAP[style_name] = folder_id_remap[old_fid]
-                # Guardar todo
                 save_presets_to_settings(self.settings, PRESETS)
-                save_folders_to_settings(self.settings)
                 self.symb_combo.blockSignals(True)
                 self.symb_combo.clear()
                 self.symb_combo.addItems(list(PRESETS.keys()))
                 self.symb_combo.blockSignals(False)
-                n_folders = len(new_folders)
-                QMessageBox.information(self, "Importar TyperTools/TypeR",
-                    f"✓ {len(converted)} estilos importados\n"
-                    f"✓ {n_folders} carpeta(s) importadas\n"
+                QMessageBox.information(self, "Importar TyperTools",
+                    f"✓ {len(converted)} estilos importados desde TyperTools\n"
                     f"(versión {raw.get('version', '?')}, exportado {raw.get('exported', '?')[:10]})")
                 return
 
@@ -6326,63 +5841,60 @@ class MangaTextTool(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Importar", f"No se pudo importar:\n{e}")
 
-    def _import_from_typertools(self, data: dict):
-        """Convierte estilos + carpetas de TyperTools/TypeR export al formato nativo.
-
-        Retorna: (styles_dict, folders_list, folder_map_dict)
-          • styles_dict    → {name: TextStyle}
-          • folders_list   → [{"id": ..., "name": ...}]  (carpetas tal como vienen del JSON)
-          • folder_map_dict→ {style_name: folder_id_original}
+    def _import_from_typertools(self, data: dict) -> dict:
+        """Convierte estilos de TyperTools/TypeR export al formato nativo TextStyle.
 
         Fuentes de datos:
           • textProps.layerText.textStyleRange[0].textStyle  → fuente, tamaño, bold, italic, color texto
           • textProps.layerText.paragraphStyleRange[0].paragraphStyle → alineación
           • stroke  (campo TypeR separado)  → color y grosor del contorno
           • textStyle.strokeColor           → fallback si no existe stroke (TyperTools legacy)
-          • style.folder                    → ID de carpeta (referencia a data["folders"])
-          • style.prefixColor               → color del punto indicador
         """
 
         def _hex_from_ps(c: dict) -> str:
-            """Color Photoshop: {red,green,blue} (0-255) o {redFloat,...} (0-1)."""
+            """Convierte color Photoshop: {red,green,blue} (0-255)
+            o {redFloat,greenFloat,blueFloat} (0-1, con posible overflow)."""
             if 'redFloat' in c or 'greenFloat' in c:
                 r = min(1.0, max(0.0, float(c.get('redFloat',   c.get('red',   0)))))
                 g = min(1.0, max(0.0, float(c.get('greenFloat', c.get('green', 0)))))
                 b = min(1.0, max(0.0, float(c.get('blueFloat',  c.get('blue',  0)))))
                 return f"#{int(round(r*255)):02X}{int(round(g*255)):02X}{int(round(b*255)):02X}"
-            return f"#{int(c.get('red',0)):02X}{int(c.get('green',0)):02X}{int(c.get('blue',0)):02X}"
+            r = int(c.get('red',   0))
+            g = int(c.get('green', 0))
+            b = int(c.get('blue',  0))
+            return f"#{r:02X}{g:02X}{b:02X}"
 
         def _hex_from_stroke(c: dict) -> str:
-            """Color stroke TypeR: {r,g,b} (0-255)."""
-            return (f"#{int(c.get('r', c.get('red',   255))):02X}"
-                    f"{int(c.get('g', c.get('green', 255))):02X}"
-                    f"{int(c.get('b', c.get('blue',  255))):02X}")
+            """Convierte color del campo stroke de TypeR: {r,g,b} (0-255)."""
+            r = int(c.get('r', c.get('red',   255)))
+            g = int(c.get('g', c.get('green', 255)))
+            b = int(c.get('b', c.get('blue',  255)))
+            return f"#{r:02X}{g:02X}{b:02X}"
 
         ALIGN_MAP = {
-            'center': 'center', 'left': 'left', 'right': 'right',
-            'justifyLeft': 'left', 'justifyRight': 'right',
-            'justifyAll': 'center', 'justifyFull': 'center', 'justify': 'center',
+            'center':       'center',
+            'left':         'left',
+            'right':        'right',
+            'justifyLeft':  'left',
+            'justifyRight': 'right',
+            'justifyAll':   'center',
+            'justifyFull':  'center',
+            'justify':      'center',
         }
         CAPS_MAP = {
-            'normal': 'mixed', 'allCaps': 'uppercase',
-            'smallCaps': 'mixed', 'smallCapsAll': 'mixed',
+            'normal':       'mixed',
+            'allCaps':      'uppercase',
+            'smallCaps':    'mixed',
+            'smallCapsAll': 'mixed',
         }
 
-        # ── Carpetas del JSON ────────────────────────────────────────────────
-        raw_folders: List[Dict] = data.get("folders", [])
-        # folders_list: lista limpia con id+name
-        folders_list = [{"id": f["id"], "name": f["name"]}
-                        for f in raw_folders if f.get("id") and f.get("name")]
-
-        # ── Estilos ──────────────────────────────────────────────────────────
-        result: dict        = {}
-        folder_map: dict    = {}   # style_name → folder_id_original
-
+        result: dict = {}
         for style in data.get("styles", []):
             name = (style.get("name") or "").strip()
             if not name:
                 continue
 
+            # ── Texto / fuente ──────────────────────────────────────────────
             layer     = style.get("textProps", {}).get("layerText", {})
             ts_ranges = layer.get("textStyleRange", [])
             ps_ranges = layer.get("paragraphStyleRange", [])
@@ -6397,19 +5909,18 @@ class MangaTextTool(QMainWindow):
             alignment   = ALIGN_MAP.get(ps.get("alignment", "center"), "center")
             caps        = CAPS_MAP.get(ts.get("fontCaps", "normal"), "mixed")
 
-            # Contorno: campo stroke (TypeR) o strokeColor legacy (TyperTools)
-            stroke      = style.get("stroke", {})
-            stroke_on   = bool(stroke.get("enabled", False))
-            stroke_size = max(1, int(round(stroke.get("size", 3)))) if stroke_on else 3
+            # ── Contorno (stroke) ───────────────────────────────────────────
+            # TypeR almacena el stroke como efecto de capa en style["stroke"]
+            # TyperTools legacy lo ponía en textStyle["strokeColor"]
+            stroke = style.get("stroke", {})
+            stroke_on    = bool(stroke.get("enabled", False))
+            stroke_size  = max(1, int(round(stroke.get("size", 3)))) if stroke_on else 3
             if stroke_on and stroke.get("color"):
                 outline_col = _hex_from_stroke(stroke["color"])
-            elif "strokeColor" in ts:
+            elif "strokeColor" in ts:            # fallback TyperTools legacy
                 outline_col = _hex_from_ps(ts["strokeColor"])
             else:
                 outline_col = "#FFFFFF"
-
-            # Color del punto: prefixColor del estilo TypeR
-            prefix_color = (style.get("prefixColor") or "#888888").strip() or "#888888"
 
             result[name] = TextStyle(
                 font_family        = font_family,
@@ -6425,31 +5936,6 @@ class MangaTextTool(QMainWindow):
                 line_spacing       = 1.2,
                 shadow_enabled     = False,
                 background_enabled = False,
-                prefix_color       = prefix_color,
-            )
-
-            # Mapa estilo → carpeta (usar el folder_id original del JSON)
-            fid = style.get("folder")
-            if fid:
-                folder_map[name] = fid
-
-        return result, folders_list, folder_map
-
-    def _import_from_tpl(self, data: bytes) -> dict:
-        """Convierte los bytes de un .tpl de Photoshop en un dict name→TextStyle."""
-        raw_presets = _parse_tpl_presets(data)
-        result = {}
-        for p in raw_presets:
-            result[p['name']] = TextStyle(
-                font_family     = p['font'],
-                bold            = p['bold'],
-                italic          = p['italic'],
-                font_point_size = p['size'],
-                alignment       = p['align'],
-                fill            = p['fill_color'],
-                capitalization  = 'uppercase' if p['all_caps'] else 'mixed',
-                outline         = p['stroke_color'],
-                outline_width   = p['stroke_size'],
             )
         return result
 
@@ -6944,9 +6430,7 @@ class MangaTextTool(QMainWindow):
     def configure_fonts_per_preset(self):
         dlg = FontsPerPresetDialog(self, PRESETS)
         if dlg.exec() != QDialog.DialogCode.Accepted: return
-        apply_existing = dlg.apply_changes()
-        save_presets_to_settings(self.settings, PRESETS)
-        save_folders_to_settings(self.settings)   # persiste carpetas y mapa
+        apply_existing = dlg.apply_changes(); save_presets_to_settings(self.settings, PRESETS)
         try: current_key = self.symb_combo.currentText()
         except Exception: current_key = None
         self.symb_combo.blockSignals(True); self.symb_combo.clear(); self.symb_combo.addItems(list(PRESETS.keys()))
@@ -7260,414 +6744,344 @@ class StyleEditorWidget(QWidget):
 # ---------------- Diálogo de fuentes por simbología (Mejorado estilo TypeR) ----------------
 
 class FontsPerPresetDialog(QDialog):
-    """Gestor de estilos con soporte de carpetas, tamaño rápido y color de punto (estilo TypeR)."""
-
+    """Diálogo mejorado para gestionar estilos/fuentes por simbología (estilo TypeR)."""
+    
     def __init__(self, parent, presets: Dict[str, TextStyle]):
         super().__init__(parent)
-        self.setWindowTitle("Gestor de Estilos – Carpetas y fuentes por simbología")
-        self.setMinimumSize(980, 640)
+        self.setWindowTitle("Gestor de Estilos – Definir fuentes por simbología")
+        self.setMinimumSize(800, 600)
         self.presets = presets
         self._current_key: Optional[str] = None
-        self._current_folder_id = "__unsorted__"   # None=todos | "__unsorted__"=sin carpeta | str=id real
         self._apply_existing = False
-
+        
         self._build_ui()
-        self._populate_folders()   # carga lista de carpetas y filtra estilos
-
+        self._populate_list()
+        
+        # Seleccionar el primero
         if self.style_list.count() > 0:
             self.style_list.setCurrentRow(0)
-
-    # ─────────────────────────────────────────────────────────────────────────
+    
     def _build_ui(self):
-        main = QVBoxLayout(self)
-        main.setSpacing(8)
-
-        panels = QWidget()
-        pl = QHBoxLayout(panels)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.setSpacing(8)
-
-        # ── Panel CARPETAS (izquierda) ────────────────────────────────────────
-        fp = QWidget(); fp.setFixedWidth(190)
-        fl = QVBoxLayout(fp); fl.setContentsMargins(0, 0, 0, 0); fl.setSpacing(4)
-
-        hdr_f = QLabel("Carpetas"); hdr_f.setStyleSheet("font-weight:bold;")
-        fl.addWidget(hdr_f)
-
-        self.folder_list = QListWidget()
-        self.folder_list.currentRowChanged.connect(self._on_folder_selected)
-        fl.addWidget(self.folder_list, 1)
-
-        fbr = QHBoxLayout(); fbr.setSpacing(2)
-        self.add_folder_btn    = QPushButton("➕"); self.add_folder_btn.setFixedWidth(30)
-        self.rename_folder_btn = QPushButton("✏");  self.rename_folder_btn.setFixedWidth(30)
-        self.del_folder_btn    = QPushButton("🗑");  self.del_folder_btn.setFixedWidth(30)
-        self.add_folder_btn.setToolTip("Nueva carpeta")
-        self.rename_folder_btn.setToolTip("Renombrar carpeta")
-        self.del_folder_btn.setToolTip("Eliminar carpeta")
-        self.add_folder_btn.clicked.connect(self._add_folder)
-        self.rename_folder_btn.clicked.connect(self._rename_folder)
-        self.del_folder_btn.clicked.connect(self._delete_folder)
-        fbr.addWidget(self.add_folder_btn)
-        fbr.addWidget(self.rename_folder_btn)
-        fbr.addWidget(self.del_folder_btn)
-        fbr.addStretch()
-        fl.addLayout(fbr)
-        pl.addWidget(fp)
-
-        # ── Panel ESTILOS (centro) ────────────────────────────────────────────
-        sp = QWidget(); sp.setMinimumWidth(210)
-        sl = QVBoxLayout(sp); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(4)
-
-        sh = QHBoxLayout()
-        self.styles_title = QLabel("Estilos"); self.styles_title.setStyleSheet("font-weight:bold;")
-        sh.addWidget(self.styles_title, 1)
-        self.move_combo = QComboBox(); self.move_combo.setToolTip("Mover estilo a carpeta")
-        move_btn = QPushButton("→"); move_btn.setFixedWidth(26)
-        move_btn.setToolTip("Mover estilo seleccionado a la carpeta elegida")
-        move_btn.clicked.connect(self._move_to_folder)
-        sh.addWidget(self.move_combo); sh.addWidget(move_btn)
-        sl.addLayout(sh)
-
+        # Layout principal vertical
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(12)
+        
+        # === Contenedor horizontal para los dos paneles ===
+        panels_widget = QWidget()
+        panels_layout = QHBoxLayout(panels_widget)
+        panels_layout.setContentsMargins(0, 0, 0, 0)
+        panels_layout.setSpacing(12)
+        
+        # === Panel izquierdo: Lista de estilos ===
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Título
+        title_lbl = QLabel("Estilos disponibles")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 14px;")
+        left_layout.addWidget(title_lbl)
+        
+        # Lista de estilos
         self.style_list = QListWidget()
+        self.style_list.setMinimumWidth(200)
         self.style_list.currentRowChanged.connect(self._on_style_selected)
-        sl.addWidget(self.style_list, 1)
-
-        sbr = QHBoxLayout(); sbr.setSpacing(4)
-        self.add_btn = QPushButton("➕ Nuevo");    self.add_btn.clicked.connect(self._add_style)
-        self.dup_btn = QPushButton("📋 Duplicar"); self.dup_btn.clicked.connect(self._duplicate_style)
-        self.del_btn = QPushButton("🗑 Eliminar"); self.del_btn.clicked.connect(self._delete_style)
-        for b in (self.add_btn, self.dup_btn, self.del_btn): sbr.addWidget(b)
-        sl.addLayout(sbr)
-
-        ior = QHBoxLayout(); ior.setSpacing(4)
-        self.export_btn = QPushButton("📤 Exportar"); self.export_btn.clicked.connect(self._export_style)
-        self.import_btn = QPushButton("📥 Importar"); self.import_btn.clicked.connect(self._import_style)
-        self.reset_btn  = QPushButton("🔄 Restaurar"); self.reset_btn.clicked.connect(self._reset_defaults)
-        for b in (self.export_btn, self.import_btn, self.reset_btn): ior.addWidget(b)
-        sl.addLayout(ior)
-        pl.addWidget(sp)
-
-        # ── Panel EDITOR (derecha) ────────────────────────────────────────────
-        rp = QWidget()
-        rl = QVBoxLayout(rp); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(6)
-
-        # Fila nombre + punto de color
-        nr = QHBoxLayout()
-        nr.addWidget(QLabel("Nombre:"))
+        left_layout.addWidget(self.style_list)
+        
+        # Botones de gestión
+        btn_row = QHBoxLayout()
+        
+        self.add_btn = QPushButton("➕ Nuevo")
+        self.add_btn.setToolTip("Crear nuevo estilo")
+        self.add_btn.clicked.connect(self._add_style)
+        btn_row.addWidget(self.add_btn)
+        
+        self.dup_btn = QPushButton("📋 Duplicar")
+        self.dup_btn.setToolTip("Duplicar estilo seleccionado")
+        self.dup_btn.clicked.connect(self._duplicate_style)
+        btn_row.addWidget(self.dup_btn)
+        
+        self.del_btn = QPushButton("🗑️ Eliminar")
+        self.del_btn.setToolTip("Eliminar estilo seleccionado")
+        self.del_btn.clicked.connect(self._delete_style)
+        btn_row.addWidget(self.del_btn)
+        
+        left_layout.addLayout(btn_row)
+        
+        # Botones de importar/exportar
+        io_row = QHBoxLayout()
+        
+        self.export_btn = QPushButton("📤 Exportar")
+        self.export_btn.setToolTip("Exportar estilo seleccionado a JSON")
+        self.export_btn.clicked.connect(self._export_style)
+        io_row.addWidget(self.export_btn)
+        
+        self.import_btn = QPushButton("📥 Importar")
+        self.import_btn.setToolTip("Importar estilo desde JSON")
+        self.import_btn.clicked.connect(self._import_style)
+        io_row.addWidget(self.import_btn)
+        
+        left_layout.addLayout(io_row)
+        
+        # Restaurar defaults
+        self.reset_btn = QPushButton("🔄 Restaurar defaults")
+        self.reset_btn.setToolTip("Restaurar estilos predeterminados")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        left_layout.addWidget(self.reset_btn)
+        
+        panels_layout.addWidget(left_panel)
+        
+        # === Panel derecho: Editor de estilo ===
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Nombre del estilo
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Nombre:"))
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Nombre del estilo")
         self.name_edit.textChanged.connect(self._on_name_changed)
-        self.dot_btn = QPushButton()
-        self.dot_btn.setFixedSize(24, 24)
-        self.dot_btn.setToolTip("Color del punto indicador (clic para cambiar)")
-        self.dot_btn.clicked.connect(self._pick_dot_color)
-        self._set_dot_color("#888888")
-        nr.addWidget(self.name_edit, 1)
-        nr.addWidget(self.dot_btn)
-        rl.addLayout(nr)
-
-        # Fila tamaño rápido ±
-        sr = QHBoxLayout()
-        sr.addWidget(QLabel("Tamaño:"))
-        self.size_dec = QPushButton("−"); self.size_dec.setFixedWidth(28)
-        self.size_dec.setAutoRepeat(True); self.size_dec.setAutoRepeatInterval(80)
-        self.size_dec.clicked.connect(self._quick_dec)
-        self.size_lbl = QLabel("--")
-        self.size_lbl.setFixedWidth(38); self.size_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.size_lbl.setStyleSheet("font-weight:bold; border:1px solid #444; border-radius:3px; padding:1px 3px;")
-        self.size_inc = QPushButton("+"); self.size_inc.setFixedWidth(28)
-        self.size_inc.setAutoRepeat(True); self.size_inc.setAutoRepeatInterval(80)
-        self.size_inc.clicked.connect(self._quick_inc)
-        sr.addWidget(self.size_dec); sr.addWidget(self.size_lbl); sr.addWidget(self.size_inc)
-        sr.addStretch()
-        rl.addLayout(sr)
-
-        # Preview
-        pg = QFrame(); pg.setStyleSheet("QFrame{background:#1a1a2e;border:1px solid #333;border-radius:6px;}")
-        pgl = QVBoxLayout(pg)
-        pt = QLabel("Vista previa"); pt.setStyleSheet("color:#888;font-size:11px;background:transparent;border:none;")
-        pgl.addWidget(pt)
+        name_row.addWidget(self.name_edit)
+        right_layout.addLayout(name_row)
+        
+        # Vista previa
+        preview_group = QFrame()
+        preview_group.setStyleSheet("QFrame { background: #1a1a2e; border: 1px solid #333; border-radius: 6px; }")
+        preview_layout = QVBoxLayout(preview_group)
+        
+        preview_title = QLabel("Vista previa")
+        preview_title.setStyleSheet("color: #888; font-size: 11px; background: transparent; border: none;")
+        preview_layout.addWidget(preview_title)
+        
         self.preview_widget = StylePreviewWidget()
-        pgl.addWidget(self.preview_widget)
-        rl.addWidget(pg)
-
+        preview_layout.addWidget(self.preview_widget)
+        
+        right_layout.addWidget(preview_group)
+        
         # Editor de propiedades
-        eg = QFrame(); eg.setStyleSheet("QFrame{border:1px solid #333;border-radius:6px;}")
-        egl = QVBoxLayout(eg)
+        editor_group = QFrame()
+        editor_group.setStyleSheet("QFrame { border: 1px solid #333; border-radius: 6px; }")
+        editor_layout = QVBoxLayout(editor_group)
+        
         self.style_editor = StyleEditorWidget()
         self.style_editor.styleChanged.connect(self._on_style_changed)
-        egl.addWidget(self.style_editor)
-        rl.addWidget(eg, 1)
-        pl.addWidget(rp, 1)
-
-        main.addWidget(panels, 1)
-
+        editor_layout.addWidget(self.style_editor)
+        
+        right_layout.addWidget(editor_group, 1)
+        
+        panels_layout.addWidget(right_panel, 1)
+        
+        # Añadir paneles al layout principal
+        main_layout.addWidget(panels_widget, 1)
+        
+        # === Botones de diálogo (abajo) ===
         self.apply_chk = QCheckBox("Aplicar cambios a elementos existentes de cada tipo")
-        main.addWidget(self.apply_chk)
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
-        main.addWidget(bb)
-
-    # ── Dot color ─────────────────────────────────────────────────────────────
-    def _set_dot_color(self, color: str):
-        self.dot_btn.setStyleSheet(
-            f"QPushButton{{background:{color};border-radius:11px;border:1px solid #555;}}"
-            f"QPushButton:hover{{border-color:#AAA;}}"
+        main_layout.addWidget(self.apply_chk)
+        
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self._dot_color = color
-
-    def _pick_dot_color(self):
-        if not self._current_key: return
-        color = QColorDialog.getColor(QColor(self._dot_color), self, "Color del punto")
-        if color.isValid():
-            st = self.presets.get(self._current_key)
-            if st: st.prefix_color = color.name()
-            self._set_dot_color(color.name())
-            self._refresh_style_list_item()
-
-    def _refresh_style_list_item(self):
-        row = self.style_list.currentRow()
-        if row >= 0 and self._current_key:
-            self.style_list.item(row).setForeground(QColor(self._dot_color))
-
-    # ── Tamaño rápido ─────────────────────────────────────────────────────────
-    def _quick_dec(self):
-        st = self.presets.get(self._current_key) if self._current_key else None
-        if st and st.font_point_size > 6:
-            st.font_point_size -= 1
-            self.size_lbl.setText(str(st.font_point_size))
-            self.style_editor.set_style(st); self.preview_widget.set_style(st)
-
-    def _quick_inc(self):
-        st = self.presets.get(self._current_key) if self._current_key else None
-        if st and st.font_point_size < 300:
-            st.font_point_size += 1
-            self.size_lbl.setText(str(st.font_point_size))
-            self.style_editor.set_style(st); self.preview_widget.set_style(st)
-
-    # ── Carpetas ──────────────────────────────────────────────────────────────
-    def _populate_folders(self):
-        self.folder_list.clear()
-
-        all_item = QListWidgetItem("📁 Todos")
-        all_item.setData(Qt.ItemDataRole.UserRole, None)
-        self.folder_list.addItem(all_item)
-
-        n_unsorted = sum(1 for k in self.presets if not PRESET_FOLDER_MAP.get(k))
-        us_item = QListWidgetItem(f"📂 Sin ordenar  ({n_unsorted})")
-        us_item.setData(Qt.ItemDataRole.UserRole, "__unsorted__")
-        self.folder_list.addItem(us_item)
-
-        for folder in PRESET_FOLDERS:
-            cnt = sum(1 for v in PRESET_FOLDER_MAP.values() if v == folder['id'])
-            fi = QListWidgetItem(f"📁 {folder['name']}  ({cnt})")
-            fi.setData(Qt.ItemDataRole.UserRole, folder['id'])
-            self.folder_list.addItem(fi)
-
-        # Combo mover-a
-        self.move_combo.clear()
-        self.move_combo.addItem("Sin ordenar", "__unsorted__")
-        for folder in PRESET_FOLDERS:
-            self.move_combo.addItem(folder['name'], folder['id'])
-
-        # Seleccionar fila que corresponde al filtro actual
-        for i in range(self.folder_list.count()):
-            if self.folder_list.item(i).data(Qt.ItemDataRole.UserRole) == self._current_folder_id:
-                self.folder_list.setCurrentRow(i); break
-        else:
-            self.folder_list.setCurrentRow(0)
-
-    def _on_folder_selected(self, row: int):
-        if row < 0: return
-        item = self.folder_list.item(row)
-        self._current_folder_id = item.data(Qt.ItemDataRole.UserRole)
-        is_real = isinstance(self._current_folder_id, str) and self._current_folder_id != "__unsorted__"
-        self.rename_folder_btn.setEnabled(is_real)
-        self.del_folder_btn.setEnabled(is_real)
-        self._populate_styles()
-
-    def _populate_styles(self):
-        self.style_list.clear()
-        fid = self._current_folder_id
-        for key, st in self.presets.items():
-            assigned = PRESET_FOLDER_MAP.get(key)
-            if fid is None:                                  # Todos
-                pass
-            elif fid == "__unsorted__":
-                if assigned: continue
-            else:
-                if assigned != fid: continue
-            item = QListWidgetItem(key)
-            dot = getattr(st, 'prefix_color', '#888888')
-            if dot != '#888888':
-                item.setForeground(QColor(dot))
-            self.style_list.addItem(item)
-
-        cnt = self.style_list.count()
-        fid_label = {None: "Todos", "__unsorted__": "Sin ordenar"}.get(
-            self._current_folder_id,
-            next((f['name'] for f in PRESET_FOLDERS if f['id'] == self._current_folder_id), "?")
-        )
-        self.styles_title.setText(f"Estilos – {fid_label}  ({cnt})")
-
-        if cnt > 0: self.style_list.setCurrentRow(0)
-
-    def _add_folder(self):
-        name, ok = QInputDialog.getText(self, "Nueva carpeta", "Nombre:")
-        if ok and name.strip():
-            new_id = _new_folder_id()
-            PRESET_FOLDERS.append({"id": new_id, "name": name.strip()})
-            self._current_folder_id = new_id
-            self._populate_folders()
-
-    def _rename_folder(self):
-        fid = self._current_folder_id
-        folder = next((f for f in PRESET_FOLDERS if f['id'] == fid), None)
-        if not folder: return
-        name, ok = QInputDialog.getText(self, "Renombrar carpeta", "Nuevo nombre:", text=folder['name'])
-        if ok and name.strip():
-            folder['name'] = name.strip()
-            self._populate_folders()
-
-    def _delete_folder(self):
-        fid = self._current_folder_id
-        folder = next((f for f in PRESET_FOLDERS if f['id'] == fid), None)
-        if not folder: return
-        r = QMessageBox.question(self, "Eliminar carpeta",
-            f"¿Eliminar '{folder['name']}'?\nLos estilos quedarán sin carpeta.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if r == QMessageBox.StandardButton.Yes:
-            PRESET_FOLDERS[:] = [f for f in PRESET_FOLDERS if f['id'] != fid]
-            for k in list(PRESET_FOLDER_MAP):
-                if PRESET_FOLDER_MAP[k] == fid: del PRESET_FOLDER_MAP[k]
-            self._current_folder_id = "__unsorted__"
-            self._populate_folders()
-
-    def _move_to_folder(self):
-        if not self._current_key: return
-        target = self.move_combo.currentData()
-        if target == "__unsorted__":
-            PRESET_FOLDER_MAP.pop(self._current_key, None)
-        else:
-            PRESET_FOLDER_MAP[self._current_key] = target
-        self._populate_folders()
-        self._populate_styles()
-
-    # ── Estilos ───────────────────────────────────────────────────────────────
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        main_layout.addWidget(btn_box)
+    
     def _populate_list(self):
-        self._populate_styles()
-
+        self.style_list.clear()
+        for key in self.presets.keys():
+            item = QListWidgetItem(key)
+            self.style_list.addItem(item)
+    
     def _on_style_selected(self, row: int):
-        if row < 0: self._current_key = None; return
-        item = self.style_list.item(row)
-        if not item: return
-        self._current_key = item.text()
-        st = self.presets.get(self._current_key)
-        if st:
+        if row < 0:
+            self._current_key = None
+            return
+        
+        self._current_key = self.style_list.item(row).text()
+        style = self.presets.get(self._current_key)
+        
+        if style:
             self.name_edit.blockSignals(True)
             self.name_edit.setText(self._current_key)
             self.name_edit.blockSignals(False)
-            self.size_lbl.setText(str(st.font_point_size))
-            self._set_dot_color(getattr(st, 'prefix_color', '#888888'))
-            self.style_editor.set_style(st)
-            self.preview_widget.set_style(st)
-
+            
+            self.style_editor.set_style(style)
+            self.preview_widget.set_style(style)
+    
     def _on_style_changed(self):
         if self._current_key and self._current_key in self.presets:
-            st = self.presets[self._current_key]
-            self.size_lbl.setText(str(st.font_point_size))
-            self.preview_widget.set_style(st)
-
+            self.preview_widget.set_style(self.presets[self._current_key])
+    
     def _on_name_changed(self, new_name: str):
-        if not self._current_key or not new_name.strip(): return
+        if not self._current_key or not new_name.strip():
+            return
+        
         new_name = new_name.strip().upper()
-        if new_name == self._current_key or new_name in self.presets: return
-        st = self.presets.pop(self._current_key)
-        old_folder = PRESET_FOLDER_MAP.pop(self._current_key, None)
-        self.presets[new_name] = st
-        if old_folder: PRESET_FOLDER_MAP[new_name] = old_folder
+        
+        if new_name == self._current_key:
+            return
+        
+        if new_name in self.presets:
+            return
+        
+        # Renombrar
+        style = self.presets.pop(self._current_key)
+        self.presets[new_name] = style
         self._current_key = new_name
-        row = self.style_list.currentRow()
-        if self.style_list.item(row): self.style_list.item(row).setText(new_name)
-
+        
+        # Actualizar lista
+        current_row = self.style_list.currentRow()
+        self.style_list.item(current_row).setText(new_name)
+    
     def _add_style(self):
-        name = self._unique_name("NUEVO_ESTILO")
-        self.presets[name] = TextStyle()
-        if isinstance(self._current_folder_id, str) and self._current_folder_id != "__unsorted__":
-            PRESET_FOLDER_MAP[name] = self._current_folder_id
+        name, ok = self._get_unique_name("NUEVO_ESTILO")
+        if not ok:
+            return
+        
+        # Crear estilo con valores por defecto
+        new_style = TextStyle()
+        self.presets[name] = new_style
+        
+        # Añadir a la lista y seleccionar
         item = QListWidgetItem(name)
-        self.style_list.addItem(item); self.style_list.setCurrentItem(item)
-        self._populate_folders()
-
+        self.style_list.addItem(item)
+        self.style_list.setCurrentItem(item)
+    
     def _duplicate_style(self):
-        if not self._current_key: return
-        name = self._unique_name(f"{self._current_key}_COPIA")
-        new_st = replace(self.presets[self._current_key])
-        self.presets[name] = new_st
-        orig_folder = PRESET_FOLDER_MAP.get(self._current_key)
-        if orig_folder: PRESET_FOLDER_MAP[name] = orig_folder
+        if not self._current_key:
+            return
+        
+        name, ok = self._get_unique_name(f"{self._current_key}_COPIA")
+        if not ok:
+            return
+        
+        # Duplicar el estilo actual
+        original = self.presets[self._current_key]
+        new_style = replace(original)
+        self.presets[name] = new_style
+        
+        # Añadir a la lista y seleccionar
         item = QListWidgetItem(name)
-        self.style_list.addItem(item); self.style_list.setCurrentItem(item)
-        self._populate_folders()
-
+        self.style_list.addItem(item)
+        self.style_list.setCurrentItem(item)
+    
     def _delete_style(self):
-        if not self._current_key: return
+        if not self._current_key:
+            return
+        
+        # No permitir eliminar si solo queda uno
         if len(self.presets) <= 1:
-            QMessageBox.warning(self, "No se puede eliminar", "Debe haber al menos un estilo."); return
-        r = QMessageBox.question(self, "Confirmar eliminación",
+            QMessageBox.warning(self, "No se puede eliminar", 
+                              "Debe haber al menos un estilo.")
+            return
+        
+        reply = QMessageBox.question(
+            self, "Confirmar eliminación",
             f"¿Eliminar el estilo '{self._current_key}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if r == QMessageBox.StandardButton.Yes:
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
             del self.presets[self._current_key]
-            PRESET_FOLDER_MAP.pop(self._current_key, None)
-            self.style_list.takeItem(self.style_list.currentRow())
-            self._populate_folders()
-            if self.style_list.count() > 0: self.style_list.setCurrentRow(0)
-
+            row = self.style_list.currentRow()
+            self.style_list.takeItem(row)
+            
+            if self.style_list.count() > 0:
+                self.style_list.setCurrentRow(0)
+    
     def _export_style(self):
-        if not self._current_key: return
-        path, _ = QFileDialog.getSaveFileName(self, f"Exportar '{self._current_key}'",
-            f"{self._current_key}.json", "JSON (*.json)")
+        if not self._current_key:
+            return
+        
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Exportar estilo '{self._current_key}'",
+            f"{self._current_key}.json", "JSON (*.json)"
+        )
+        
         if path:
+            style = self.presets[self._current_key]
+            data = {self._current_key: asdict(style)}
             with open(path, 'w', encoding='utf-8') as f:
-                json.dump({self._current_key: asdict(self.presets[self._current_key])}, f, indent=2, ensure_ascii=False)
-            QMessageBox.information(self, "Exportado", f"Estilo exportado a:\n{path}")
-
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Exportado", 
+                                   f"Estilo exportado a:\n{path}")
+    
     def _import_style(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Importar estilo", "", "JSON (*.json)")
-        if not path: return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Importar estilo", "", "JSON (*.json)"
+        )
+        
+        if not path:
+            return
+        
         try:
-            with open(path, 'r', encoding='utf-8') as f: data = json.load(f)
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
             imported = 0
             for key, val in data.items():
+                # Si ya existe, preguntar
                 if key in self.presets:
-                    r = QMessageBox.question(self, "Estilo existente",
-                        f"'{key}' ya existe. ¿Sobrescribir?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
-                    if r == QMessageBox.StandardButton.Cancel: return
-                    if r == QMessageBox.StandardButton.No: continue
-                self.presets[key] = TextStyle(**val); imported += 1
-            self._populate_styles()
-            QMessageBox.information(self, "Importado", f"Se importaron {imported} estilo(s).")
+                    reply = QMessageBox.question(
+                        self, "Estilo existente",
+                        f"El estilo '{key}' ya existe. ¿Sobrescribir?",
+                        QMessageBox.StandardButton.Yes | 
+                        QMessageBox.StandardButton.No |
+                        QMessageBox.StandardButton.Cancel
+                    )
+                    if reply == QMessageBox.StandardButton.Cancel:
+                        return
+                    if reply == QMessageBox.StandardButton.No:
+                        continue
+                
+                self.presets[key] = TextStyle(**val)
+                imported += 1
+            
+            self._populate_list()
+            QMessageBox.information(self, "Importado", 
+                                   f"Se importaron {imported} estilo(s).")
+            
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al importar:\n{e}")
-
+    
     def _reset_defaults(self):
-        r = QMessageBox.question(self, "Restaurar defaults",
-            "¿Restaurar estilos predeterminados?\nLos personalizados se mantendrán.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if r == QMessageBox.StandardButton.Yes:
-            for k, v in default_presets().items(): self.presets[k] = v
-            self._populate_styles()
-            if self.style_list.count() > 0: self.style_list.setCurrentRow(0)
-
-    def _unique_name(self, base: str) -> str:
-        name = base.strip().upper(); n = 2
-        while name in self.presets: name = f"{base}_{n}"; n += 1
-        return name
-
+        reply = QMessageBox.question(
+            self, "Restaurar defaults",
+            "¿Restaurar todos los estilos predeterminados?\n"
+            "Los estilos personalizados se mantendrán.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            defaults = default_presets()
+            for key, style in defaults.items():
+                self.presets[key] = style
+            
+            self._populate_list()
+            if self.style_list.count() > 0:
+                self.style_list.setCurrentRow(0)
+    
+    def _get_unique_name(self, base: str) -> tuple:
+        """Pide un nombre único para el estilo."""
+        name = base
+        counter = 1
+        while name in self.presets:
+            name = f"{base}_{counter}"
+            counter += 1
+        
+        text, ok = QLineEdit.getText(
+            QLineEdit(), "Nombre del estilo", "Nombre:", 
+            QLineEdit.EchoMode.Normal, name
+        ) if False else (name, True)  # Simplificado: usar nombre generado
+        
+        # Validar
+        if ok:
+            name = name.strip().upper()
+            if not name:
+                return "", False
+        
+        return name, ok
+    
     def apply_changes(self) -> bool:
         return self.apply_chk.isChecked()
 
