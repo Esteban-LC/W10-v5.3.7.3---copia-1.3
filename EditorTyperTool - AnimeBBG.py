@@ -5887,18 +5887,57 @@ class MangaTextTool(QMainWindow):
             return
         item = items[0]
         base = item.style.to_qfont()
-        font, ok = QFontDialog.getFont(base, self, "Elegir fuente")
-        if not ok: return
-        new_family, new_pt, new_bold, new_italic = font.family(), font.pointSize(), font.bold(), font.italic()
-        apply_to_selected(ctx, [item], "Cambiar fuente", lambda: [
-            setattr(item.style, 'font_family', new_family),
-            setattr(item.style, 'font_point_size', new_pt),
-            setattr(item.style, 'bold', new_bold),
-            setattr(item.style, 'italic', new_italic),
-            item.setFont(item.style.to_qfont()),
+
+        # Guardar valores originales para restaurar si se cancela
+        orig_family = item.style.font_family
+        orig_pt     = item.style.font_point_size
+        orig_bold   = item.style.bold
+        orig_italic = item.style.italic
+
+        dlg = QFontDialog(base, self)
+        dlg.setWindowTitle("Elegir fuente")
+
+        def _preview_live(font: QFont):
+            item.style.font_family    = font.family()
+            item.style.font_point_size = font.pointSize()
+            item.style.bold           = font.bold()
+            item.style.italic         = font.italic()
+            item.setFont(item.style.to_qfont())
             item._apply_paragraph_to_doc()
-        ])
-        self._sync_props_from_item(item)
+            self._sync_props_from_item(item)
+
+        dlg.currentFontChanged.connect(_preview_live)
+
+        if dlg.exec():
+            font = dlg.selectedFont()
+            new_family  = font.family()
+            new_pt      = font.pointSize()
+            new_bold    = font.bold()
+            new_italic  = font.italic()
+            # Restaurar originales para que apply_to_selected capture el snapshot correcto
+            item.style.font_family    = orig_family
+            item.style.font_point_size = orig_pt
+            item.style.bold           = orig_bold
+            item.style.italic         = orig_italic
+            item.setFont(item.style.to_qfont())
+            apply_to_selected(ctx, [item], "Cambiar fuente", lambda: [
+                setattr(item.style, 'font_family',     new_family),
+                setattr(item.style, 'font_point_size', new_pt),
+                setattr(item.style, 'bold',            new_bold),
+                setattr(item.style, 'italic',          new_italic),
+                item.setFont(item.style.to_qfont()),
+                item._apply_paragraph_to_doc()
+            ])
+            self._sync_props_from_item(item)
+        else:
+            # Cancelado: revertir a la fuente original
+            item.style.font_family    = orig_family
+            item.style.font_point_size = orig_pt
+            item.style.bold           = orig_bold
+            item.style.italic         = orig_italic
+            item.setFont(item.style.to_qfont())
+            item._apply_paragraph_to_doc()
+            self._sync_props_from_item(item)
 
     def _get_current_qcolor(self, which: str, item: StrokeTextItem) -> QColor:
         return {'fill': qcolor_from_hex(item.style.fill, "#000000"),
